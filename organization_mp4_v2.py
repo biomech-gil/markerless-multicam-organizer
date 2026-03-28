@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import shutil
 import math
 import threading
@@ -205,9 +206,10 @@ class SetMatcher:
                 })
         return plan
 
-    def execute_rename(self, plan, progress_callback=None):
+    def execute_rename(self, plan, root_folder, progress_callback=None):
         success = 0
         errors = []
+        rename_log = []  # 되돌리기용 로그
         total = len(plan)
 
         # 충돌 방지: 임시 이름으로 먼저 변경
@@ -216,6 +218,10 @@ class SetMatcher:
             if item['already_correct']:
                 temp_plans.append(None)
                 success += 1
+                rename_log.append({
+                    'cam': item['cam'], 'old': item['old_filename'],
+                    'new': item['new_filename'], 'dir': os.path.dirname(item['old_path'])
+                })
                 continue
             temp_name = f"__temp_rename_{idx}__.mp4"
             temp_path = os.path.join(os.path.dirname(item['old_path']), temp_name)
@@ -242,13 +248,89 @@ class SetMatcher:
             try:
                 os.rename(temp_plans[idx], item['new_path'])
                 success += 1
+                rename_log.append({
+                    'cam': item['cam'], 'old': item['old_filename'],
+                    'new': item['new_filename'], 'dir': os.path.dirname(item['old_path'])
+                })
             except Exception as e:
                 errors.append(f"{item['new_filename']}: {e}")
-                # 복구 시도
                 try:
                     os.rename(temp_plans[idx], item['old_path'])
                 except:
                     pass
+
+        # 리네임 로그 저장 (되돌리기용)
+        if rename_log:
+            log_path = os.path.join(root_folder, "rename_log.json")
+            try:
+                with open(log_path, 'w', encoding='utf-8') as f:
+                    json.dump(rename_log, f, ensure_ascii=False, indent=2)
+            except:
+                pass
+
+        return success, errors
+
+    @staticmethod
+    def undo_rename(root_folder, progress_callback=None):
+        """rename_log.json을 읽어 리네임을 되돌린다."""
+        log_path = os.path.join(root_folder, "rename_log.json")
+        if not os.path.exists(log_path):
+            return 0, ["rename_log.json 파일을 찾을 수 없습니다."]
+
+        with open(log_path, 'r', encoding='utf-8') as f:
+            rename_log = json.load(f)
+
+        success = 0
+        errors = []
+        total = len(rename_log)
+
+        # 충돌 방지: 현재(new) → 임시 → 원본(old)
+        temp_plans = []
+        for idx, entry in enumerate(rename_log):
+            if entry['old'] == entry['new']:
+                temp_plans.append(None)
+                success += 1
+                continue
+            temp_name = f"__temp_undo_{idx}__.mp4"
+            temp_path = os.path.join(entry['dir'], temp_name)
+            temp_plans.append(temp_path)
+
+        # 1차: 현재 → 임시
+        for idx, entry in enumerate(rename_log):
+            if progress_callback:
+                progress_callback(idx + 1, total * 2, f"임시 변경: {entry['new']}")
+            if temp_plans[idx] is None:
+                continue
+            current_path = os.path.join(entry['dir'], entry['new'])
+            try:
+                os.rename(current_path, temp_plans[idx])
+            except Exception as e:
+                errors.append(f"{entry['new']}: {e}")
+                temp_plans[idx] = None
+
+        # 2차: 임시 → 원본
+        for idx, entry in enumerate(rename_log):
+            if progress_callback:
+                progress_callback(total + idx + 1, total * 2, f"복원: {entry['old']}")
+            if temp_plans[idx] is None:
+                continue
+            original_path = os.path.join(entry['dir'], entry['old'])
+            try:
+                os.rename(temp_plans[idx], original_path)
+                success += 1
+            except Exception as e:
+                errors.append(f"{entry['old']}: {e}")
+                try:
+                    os.rename(temp_plans[idx], os.path.join(entry['dir'], entry['new']))
+                except:
+                    pass
+
+        # 복원 완료 시 로그 삭제
+        if not errors:
+            try:
+                os.remove(log_path)
+            except:
+                pass
 
         return success, errors
 
@@ -970,6 +1052,8 @@ class VideoOrganizerGUI:
                   width=15, height=2, bg='#E91E63', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="3. 리네임", command=self.step3_rename,
                   width=15, height=2, bg='#9C27B0', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Button(control_frame, text="되돌리기", command=self.undo_rename,
+                  width=10, height=2, bg='#795548', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="4. 분석", command=self.step4_analyze,
                   width=15, height=2, bg='#FF9800', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="5. 검증", command=self.step5_validate,
@@ -1221,7 +1305,8 @@ class VideoOrganizerGUI:
             self.result_text.insert(tk.END, "Step 3: 리네임 실행 중...\n\n", 'header')
             self.root.update_idletasks()
 
-            success, errors = self.matcher.execute_rename(plan, self.update_progress)
+            success, errors = self.matcher.execute_rename(
+                plan, self.organizer.root_folder, self.update_progress)
 
             self.result_text.insert(tk.END, f"리네임 완료: 성공 {success}개\n", 'ok')
             if errors:
@@ -1232,6 +1317,39 @@ class VideoOrganizerGUI:
             self.progress_var.set(f"리네임 완료: 성공 {success}개, 오류 {len(errors)}개")
         else:
             self.result_text.insert(tk.END, "\n리네임이 취소되었습니다.\n", 'warning')
+
+    # ── 리네임 되돌리기 ──
+    def undo_rename(self):
+        folder = self.organizer.root_folder
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("경고", "먼저 폴더를 선택하세요.")
+            return
+
+        log_path = os.path.join(folder, "rename_log.json")
+        if not os.path.exists(log_path):
+            messagebox.showwarning("경고",
+                "rename_log.json을 찾을 수 없습니다.\n"
+                "리네임 로그가 없으면 되돌릴 수 없습니다.")
+            return
+
+        resp = messagebox.askyesno("확인",
+            "리네임을 되돌려 원본 파일명으로 복원합니다.\n진행하시겠습니까?")
+        if not resp:
+            return
+
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "리네임 되돌리기 실행 중...\n\n", 'header')
+        self.root.update_idletasks()
+
+        success, errors = SetMatcher.undo_rename(folder, self.update_progress)
+
+        self.result_text.insert(tk.END, f"복원 완료: 성공 {success}개\n", 'ok')
+        if errors:
+            self.result_text.insert(tk.END, f"오류 {len(errors)}개:\n", 'error')
+            for err in errors:
+                self.result_text.insert(tk.END, f"  {err}\n", 'error')
+
+        self.progress_var.set(f"복원 완료: 성공 {success}개, 오류 {len(errors)}개")
 
     # ── Step 4: 분석 ──
     def step4_analyze(self):
