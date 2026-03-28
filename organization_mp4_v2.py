@@ -3,6 +3,7 @@ import re
 import shutil
 import math
 import threading
+import subprocess
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 from collections import defaultdict
@@ -343,8 +344,38 @@ class VideoOrganizer:
                     'status': 'OK', 'message': '모든 카메라 동기화 확인', 'details': []}
         return self.validation_results
 
-    def organize_files(self, output_folder="OrganizedVideos", copy_mode=True, progress_callback=None):
+    def _trim_video(self, input_path, output_path, target_frames):
+        """영상을 target_frames까지만 저장 (시작 유지, 끝 트림). ffmpeg 우선, 없으면 OpenCV."""
+        try:
+            result = subprocess.run(
+                ['ffmpeg', '-i', input_path, '-frames:v', str(target_frames),
+                 '-c', 'copy', '-y', output_path],
+                capture_output=True, timeout=600
+            )
+            if result.returncode == 0:
+                return
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        # ffmpeg 없으면 OpenCV 재인코딩
+        cap = cv2.VideoCapture(input_path)
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        for _ in range(target_frames):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            out.write(frame)
+        out.release()
+        cap.release()
+
+    def organize_files(self, output_folder="OrganizedVideos", copy_mode=True,
+                       trim_mode=False, progress_callback=None):
         organized_count = 0
+        trimmed_count = 0
         error_count = 0
         errors = []
         total_files = sum(len(v) for v in self.video_groups.values())
@@ -352,24 +383,42 @@ class VideoOrganizer:
         output_path = os.path.join(self.root_folder, output_folder)
 
         for group_name, videos in self.video_groups.items():
+            # 트림 모드: 그룹 내 최소 프레임 수 계산
+            min_frames = None
+            if trim_mode and len(videos) > 1:
+                min_frames = min(v.frame_count for v in videos)
+
             for video in videos:
                 current += 1
-                if progress_callback:
-                    progress_callback(current, total_files, f"처리 중: {video.filename}")
+                needs_trim = (trim_mode and min_frames is not None
+                              and video.frame_count > min_frames)
                 try:
                     new_folder = os.path.join(output_path, group_name, video.folder)
                     os.makedirs(new_folder, exist_ok=True)
                     new_filename = video.folder + ".mp4"
                     new_filepath = os.path.join(new_folder, new_filename)
-                    if copy_mode:
-                        shutil.copy2(video.filepath, new_filepath)
+
+                    if needs_trim:
+                        if progress_callback:
+                            progress_callback(current, total_files,
+                                f"트림 중: {video.folder}/{video.filename} "
+                                f"({video.frame_count}→{min_frames}f)")
+                        self._trim_video(video.filepath, new_filepath, min_frames)
+                        trimmed_count += 1
                     else:
-                        shutil.move(video.filepath, new_filepath)
+                        if progress_callback:
+                            progress_callback(current, total_files,
+                                f"처리 중: {video.folder}/{video.filename}")
+                        if copy_mode:
+                            shutil.copy2(video.filepath, new_filepath)
+                        else:
+                            shutil.move(video.filepath, new_filepath)
+
                     organized_count += 1
                 except Exception as e:
                     error_count += 1
-                    errors.append(f"{video.filename}: {str(e)}")
-        return organized_count, error_count, errors
+                    errors.append(f"{video.folder}/{video.filename}: {str(e)}")
+        return organized_count, trimmed_count, error_count, errors
 
 
 # ─────────────────────────────────────────────
@@ -907,6 +956,10 @@ class VideoOrganizerGUI:
         tk.Radiobutton(mode_frame, text="파일 이동", variable=self.copy_mode_var,
                        value=False).pack(side=tk.LEFT, padx=10)
 
+        self.trim_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(mode_frame, text="프레임 수 통일 (최소 기준 끝 트림)",
+                       variable=self.trim_var).pack(side=tk.LEFT, padx=20)
+
         # 컨트롤 버튼 - 6단계
         control_frame = tk.Frame(self.root)
         control_frame.pack(fill=tk.X, padx=10, pady=10)
@@ -1274,21 +1327,25 @@ class VideoOrganizerGUI:
         error_groups = [name for name, v in self.organizer.validation_results.items()
                         if v['status'] == 'ERROR']
         if error_groups:
-            resp = messagebox.askyesno("경고",
+            resp = messagebox.askyesnocancel("경고",
                 f"동기화 오류가 있는 그룹 {len(error_groups)}개:\n"
                 f"{', '.join(error_groups[:10])}\n\n"
-                f"오류 그룹을 제외하고 진행하시겠습니까?\n"
-                f"(예: 오류 제외 / 아니요: 전체 취소)")
-            if not resp:
+                f"예 = 오류 포함 전체 진행\n"
+                f"아니요 = 오류 그룹 제외하고 진행\n"
+                f"취소 = 전체 취소")
+            if resp is None:  # 취소
                 return
-            # 오류 그룹 제거
-            for name in error_groups:
-                if name in self.organizer.video_groups:
-                    del self.organizer.video_groups[name]
+            if resp is False:  # 아니요 = 오류 제외
+                for name in error_groups:
+                    if name in self.organizer.video_groups:
+                        del self.organizer.video_groups[name]
+            # True = 오류 포함 진행
 
         mode = "복사" if self.copy_mode_var.get() else "이동"
+        trim = self.trim_var.get()
+        trim_info = " + 프레임 트림" if trim else ""
         resp = messagebox.askyesno("최종 확인",
-            f"파일을 {mode}하여 정리합니다.\n"
+            f"파일을 {mode}하여 정리합니다.{trim_info}\n"
             f"출력 폴더: OrganizedVideos\n"
             f"대상: {len(self.organizer.video_groups)}개 그룹\n"
             f"진행하시겠습니까?")
@@ -1296,15 +1353,18 @@ class VideoOrganizerGUI:
             return
 
         self.result_text.delete(1.0, tk.END)
-        self.result_text.insert(tk.END, f"Step 6: 파일 정리 ({mode} 모드)\n\n", 'header')
+        self.result_text.insert(tk.END, f"Step 6: 파일 정리 ({mode} 모드{trim_info})\n\n", 'header')
 
-        organized, error_count, error_details = self.organizer.organize_files(
+        organized, trimmed, error_count, error_details = self.organizer.organize_files(
             copy_mode=self.copy_mode_var.get(),
+            trim_mode=trim,
             progress_callback=self.update_progress
         )
 
         self.result_text.insert(tk.END, f"\n정리 완료!\n", 'ok')
         self.result_text.insert(tk.END, f"성공: {organized}개 파일\n", 'info')
+        if trimmed > 0:
+            self.result_text.insert(tk.END, f"트림 적용: {trimmed}개 파일\n", 'info')
         if error_count > 0:
             self.result_text.insert(tk.END, f"실패: {error_count}개 파일\n", 'error')
             for err in error_details:
@@ -1314,7 +1374,7 @@ class VideoOrganizerGUI:
         self.result_text.insert(tk.END, f"\n출력 폴더: {output_path}\n", 'info')
 
         messagebox.showinfo("완료",
-            f"파일 정리 완료!\n성공: {organized}개, 실패: {error_count}개")
+            f"파일 정리 완료!\n성공: {organized}개 (트림: {trimmed}개), 실패: {error_count}개")
 
     def run(self):
         self.root.mainloop()
