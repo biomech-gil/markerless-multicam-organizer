@@ -1,0 +1,21 @@
+# Video data (large files)
+cam*/
+*.mp4
+*.MP4
+*.avi
+*.mov
+
+# Output
+OrganizedVideos/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Claude Code
+.claude/
+
+# OS
+Thumbs.db
+.DS_Store
