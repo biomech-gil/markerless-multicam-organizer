@@ -2,9 +2,11 @@ import os
 import re
 import shutil
 import math
+import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 
 
 # ─────────────────────────────────────────────
@@ -373,7 +375,12 @@ class SetGridViewer(tk.Toplevel):
     def __init__(self, parent, matched_sets):
         super().__init__(parent)
         self.title("세트 프리뷰어 - 프레임 비교")
-        self.geometry("1200x800")
+        # 화면 크기에 맞춰 창 크기 설정 (작업표시줄 고려)
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(1200, screen_w - 40)
+        win_h = min(800, screen_h - 80)
+        self.geometry(f"{win_w}x{win_h}")
         self.matched_sets = matched_sets
         self.current_set_idx = 0
         self.current_frame = 0
@@ -384,6 +391,15 @@ class SetGridViewer(tk.Toplevel):
         self.frame_step = 1
         self.step_buttons = {}    # {step_value: Button}
         self.speed_buttons = {}   # {ms_value: Button}
+
+        # 병렬 디코딩 & 프리페치
+        self.decode_executor = None
+        self.display_sizes = {}       # {cam: (w, h)} 캐시
+        self._prefetch_data = None    # 미리 디코딩된 프레임 데이터
+        self._prefetch_frame_no = -1
+        self._prefetch_thread = None
+        self._prefetching = False
+        self._cam_next_frame = {}     # {cam: 다음 예상 프레임} seek 생략용
 
         self._setup_ui()
         self._load_set(0)
@@ -408,13 +424,18 @@ class SetGridViewer(tk.Toplevel):
         tk.Button(top, text="다음 세트 ▶▶", command=self._next_set,
                   bg='#555', fg='white', width=12).pack(side=tk.RIGHT, padx=5, pady=5)
 
-        # 영상 그리드
-        self.grid_frame = tk.Frame(self, bg='black')
-        self.grid_frame.pack(fill=tk.BOTH, expand=True)
+        # 영상 그리드 + 하단 컨트롤 (PanedWindow: 드래그로 비율 조절 가능)
+        self.viewer_paned = tk.PanedWindow(self, orient=tk.VERTICAL,
+                                           sashwidth=6, sashrelief=tk.RAISED,
+                                           bg='#666')
+        self.viewer_paned.pack(fill=tk.BOTH, expand=True)
+
+        self.grid_frame = tk.Frame(self.viewer_paned, bg='black')
+        self.viewer_paned.add(self.grid_frame, stretch='always')
 
         # 하단 컨트롤
-        bottom = tk.Frame(self, bg='#333')
-        bottom.pack(fill=tk.X)
+        bottom = tk.Frame(self.viewer_paned, bg='#333')
+        self.viewer_paned.add(bottom, stretch='never', minsize=180, height=200)
 
         # 재생 컨트롤 버튼
         ctrl = tk.Frame(bottom, bg='#333')
@@ -470,10 +491,22 @@ class SetGridViewer(tk.Toplevel):
         self.speed_buttons[33].config(bg='#2196F3')
 
     def _release_captures(self):
+        # 진행 중인 프리페치 완료 대기
+        if self._prefetching and self._prefetch_thread is not None:
+            self._prefetch_thread.join(timeout=3)
+        self._prefetching = False
+        self._prefetch_data = None
+        self._prefetch_frame_no = -1
+        self._cam_next_frame.clear()
+
         for cap in self.captures.values():
             if cap is not None:
                 cap.release()
         self.captures.clear()
+
+        if self.decode_executor is not None:
+            self.decode_executor.shutdown(wait=False)
+            self.decode_executor = None
 
     def _load_set(self, idx):
         self.playing = False
@@ -504,6 +537,12 @@ class SetGridViewer(tk.Toplevel):
         self.max_frames = max(max_frames - 1, 0)
         self.frame_slider.config(to=self.max_frames)
         self.frame_slider.set(0)
+
+        # 병렬 디코딩용 스레드 풀 생성
+        n_workers = min(len(self.cam_names), os.cpu_count() or 4)
+        self.decode_executor = ThreadPoolExecutor(max_workers=n_workers)
+        self._cam_next_frame.clear()
+        self.display_sizes.clear()
 
         # 그리드 레이아웃 계산
         for w in self.grid_frame.winfo_children():
@@ -538,45 +577,113 @@ class SetGridViewer(tk.Toplevel):
 
         self._show_frame(0)
 
+    # ── 병렬 디코딩 엔진 ──
+
+    def _decode_cam_frame(self, cam, frame_no):
+        """단일 카메라 프레임 디코딩 (워커 스레드에서 실행)"""
+        cap = self.captures.get(cam)
+        if cap is None:
+            return cam, None
+
+        # 연속 재생 시 seek 생략 (순차 read가 훨씬 빠름)
+        if self._cam_next_frame.get(cam) != frame_no:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+
+        ret, frame = cap.read()
+        if not ret:
+            return cam, None
+
+        self._cam_next_frame[cam] = frame_no + 1
+
+        # 리사이즈 + 색 변환도 워커 스레드에서 처리
+        lw, lh = self.display_sizes.get(cam, (380, 280))
+        h, w = frame.shape[:2]
+        scale = min(lw / w, lh / h)
+        new_w = max(int(w * scale), 1)
+        new_h = max(int(h * scale), 1)
+
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
+        return cam, frame_resized
+
+    def _decode_all_parallel(self, frame_no):
+        """모든 카메라를 병렬로 디코딩"""
+        futures = {cam: self.decode_executor.submit(self._decode_cam_frame, cam, frame_no)
+                   for cam in self.cam_names}
+        results = {}
+        for cam, future in futures.items():
+            _, data = future.result()
+            results[cam] = data
+        return results
+
+    def _start_prefetch(self, frame_no):
+        """다음 프레임을 백그라운드에서 미리 디코딩"""
+        if frame_no < 0 or frame_no > self.max_frames:
+            return
+        if self._prefetching:
+            return
+
+        def do_prefetch():
+            try:
+                data = self._decode_all_parallel(frame_no)
+                self._prefetch_data = data
+                self._prefetch_frame_no = frame_no
+            finally:
+                self._prefetching = False
+
+        self._prefetching = True
+        self._prefetch_thread = threading.Thread(target=do_prefetch, daemon=True)
+        self._prefetch_thread.start()
+
     def _show_frame(self, frame_no):
         if not self.captures:
             return
         self.current_frame = max(0, min(frame_no, self.max_frames))
-        self.frame_label.config(text=f"Frame: {self.current_frame}/{self.max_frames}")
-        self.frame_slider.set(self.current_frame)
 
-        self.photo_images.clear()
-
+        # 디스플레이 크기 캐시 갱신 (메인 스레드에서만 tkinter 접근)
         for cam in self.cam_names:
-            cap = self.captures.get(cam)
             label = self.grid_labels.get(cam)
-            if cap is None or label is None:
-                continue
-
-            cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
-            ret, frame = cap.read()
-
-            if ret:
+            if label:
                 lw = label.winfo_width()
                 lh = label.winfo_height()
                 if lw < 10:
                     lw = 380
                 if lh < 10:
                     lh = 280
+                self.display_sizes[cam] = (lw, lh)
 
-                h, w = frame.shape[:2]
-                scale = min(lw / w, lh / h)
-                new_w = max(int(w * scale), 1)
-                new_h = max(int(h * scale), 1)
+        # 프리페치 완료 대기 (캡처 객체 충돌 방지)
+        if self._prefetching and self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            self._prefetching = False
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
-                img = Image.fromarray(frame_resized)
+        # 프리페치 데이터 사용 또는 새로 디코딩
+        frame_data = None
+        if self._prefetch_frame_no == self.current_frame and self._prefetch_data is not None:
+            frame_data = self._prefetch_data
+            self._prefetch_data = None
+            self._prefetch_frame_no = -1
+
+        if frame_data is None:
+            frame_data = self._decode_all_parallel(self.current_frame)
+
+        # UI 갱신 (메인 스레드)
+        self.photo_images.clear()
+        for cam in self.cam_names:
+            label = self.grid_labels.get(cam)
+            if label is None:
+                continue
+            data = frame_data.get(cam)
+            if data is not None:
+                img = Image.fromarray(data)
                 photo = ImageTk.PhotoImage(img)
                 self.photo_images.append(photo)
                 label.config(image=photo)
             else:
                 label.config(image='', text='END', fg='gray')
+
+        self.frame_label.config(text=f"Frame: {self.current_frame}/{self.max_frames}")
+        self.frame_slider.set(self.current_frame)
 
     def _on_slider(self, val):
         frame_no = int(float(val))
@@ -606,11 +713,14 @@ class SetGridViewer(tk.Toplevel):
     def _play_loop(self):
         if not self.playing:
             return
-        if self.current_frame >= self.max_frames:
+        next_frame = self.current_frame + self.frame_step
+        if next_frame > self.max_frames:
             self.playing = False
             self.play_btn.config(text="▶")
             return
-        self._show_frame(self.current_frame + self.frame_step)
+        self._show_frame(next_frame)
+        # 재생 중 다음 프레임 미리 디코딩
+        self._start_prefetch(next_frame + self.frame_step)
         self.after(self.play_speed, self._play_loop)
 
     def _set_step(self, step):
@@ -1211,6 +1321,8 @@ if __name__ == "__main__":
 
     try:
         import cv2
+        # 카메라별 병렬 디코딩을 직접 관리하므로 OpenCV 내부 스레드 제한
+        cv2.setNumThreads(2)
     except ImportError:
         print("OpenCV가 설치되지 않았습니다.")
         print("설치: pip install opencv-python")
