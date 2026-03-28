@@ -356,7 +356,8 @@ class VideoOrganizer:
                 try:
                     new_folder = os.path.join(output_path, group_name, video.folder)
                     os.makedirs(new_folder, exist_ok=True)
-                    new_filepath = os.path.join(new_folder, video.filename)
+                    new_filename = video.folder + ".mp4"
+                    new_filepath = os.path.join(new_folder, new_filename)
                     if copy_mode:
                         shutil.copy2(video.filepath, new_filepath)
                     else:
