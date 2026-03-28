@@ -189,6 +189,7 @@ class SetMatcher:
                 old_path = video.filepath
                 new_filename = set_name + ".mp4"
                 new_path = os.path.join(os.path.dirname(old_path), new_filename)
+                organized_filename = cam + ".mp4"
                 plan.append({
                     'set_name': set_name,
                     'cam': cam,
@@ -196,6 +197,8 @@ class SetMatcher:
                     'old_filename': video.filename,
                     'new_filename': new_filename,
                     'new_path': new_path,
+                    'organized_filename': organized_filename,
+                    'organized_path': f"OrganizedVideos/{set_name}/{cam}/{organized_filename}",
                     'duration': video.duration,
                     'already_correct': (video.filename == new_filename)
                 })
@@ -755,7 +758,7 @@ class RenamePlanDialog(tk.Toplevel):
     def __init__(self, parent, plan, unmatched):
         super().__init__(parent)
         self.title("리네임 계획 미리보기")
-        self.geometry("900x600")
+        self.geometry("1100x600")
         self.result = False
         self.plan = plan
         self.unmatched = unmatched
@@ -772,20 +775,22 @@ class RenamePlanDialog(tk.Toplevel):
         tree_frame = tk.Frame(self)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ('set', 'cam', 'old_name', 'new_name', 'duration')
+        columns = ('set', 'cam', 'old_name', 'new_name', 'final_name', 'duration')
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=20)
 
         self.tree.heading('set', text='세트')
         self.tree.heading('cam', text='카메라')
         self.tree.heading('old_name', text='현재 파일명')
-        self.tree.heading('new_name', text='변경 후 파일명')
+        self.tree.heading('new_name', text='리네임')
+        self.tree.heading('final_name', text='최종 정리 경로')
         self.tree.heading('duration', text='길이(초)')
 
-        self.tree.column('set', width=80, anchor='center')
-        self.tree.column('cam', width=100, anchor='center')
-        self.tree.column('old_name', width=300)
-        self.tree.column('new_name', width=150, anchor='center')
-        self.tree.column('duration', width=100, anchor='center')
+        self.tree.column('set', width=70, anchor='center')
+        self.tree.column('cam', width=70, anchor='center')
+        self.tree.column('old_name', width=200)
+        self.tree.column('new_name', width=120, anchor='center')
+        self.tree.column('final_name', width=300)
+        self.tree.column('duration', width=80, anchor='center')
 
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
@@ -804,6 +809,7 @@ class RenamePlanDialog(tk.Toplevel):
                 item['cam'],
                 item['old_filename'],
                 item['new_filename'],
+                item['organized_path'],
                 f"{item['duration']:.2f}"
             ), tags=(tag,))
 
