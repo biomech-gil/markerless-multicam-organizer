@@ -1777,15 +1777,35 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.seg_listbox = tk.Listbox(seg_frame, height=3, font=('Consolas', 9))
         self.seg_listbox.pack(fill=tk.X, padx=3, pady=3)
 
-        # 구간 마크 버튼
+        # 구간 입력 (현재 프레임 버튼 + 직접 입력)
         mark = tk.Frame(bottom_fixed, bg='#444')
         mark.pack(fill=tk.X, padx=5, pady=2)
-        tk.Button(mark, text="[ 시작점 (I)", command=self._set_mark_in,
-                  bg='#FF9800', fg='white', width=12).pack(side=tk.LEFT, padx=3)
-        self.mark_label = tk.Label(mark, text="시작점: —", bg='#444', fg='white')
-        self.mark_label.pack(side=tk.LEFT, padx=10)
-        tk.Button(mark, text="끝점 ] → 추가 (O)", command=self._add_segment,
-                  bg='#4CAF50', fg='white', width=16).pack(side=tk.LEFT, padx=3)
+
+        tk.Button(mark, text="[ 현재→시작 (I)", command=self._set_mark_in,
+                  bg='#FF9800', fg='white', width=14).pack(side=tk.LEFT, padx=2)
+        tk.Button(mark, text="현재→끝 ] (O)", command=self._add_segment,
+                  bg='#4CAF50', fg='white', width=12).pack(side=tk.LEFT, padx=2)
+
+        tk.Label(mark, text="  직접입력:", bg='#444', fg='#aaa'
+                 ).pack(side=tk.LEFT, padx=(10, 2))
+        self.in_entry = tk.Entry(mark, width=12, font=('Consolas', 9))
+        self.in_entry.pack(side=tk.LEFT, padx=1)
+        self.in_entry.insert(0, "0")
+        tk.Label(mark, text="~", bg='#444', fg='white').pack(side=tk.LEFT)
+        self.out_entry = tk.Entry(mark, width=12, font=('Consolas', 9))
+        self.out_entry.pack(side=tk.LEFT, padx=1)
+        self.out_entry.insert(0, "0")
+
+        # 단위 선택
+        self.unit_var = tk.StringVar(value="frame")
+        tk.Radiobutton(mark, text="프레임", variable=self.unit_var,
+                       value="frame", bg='#444', fg='white',
+                       selectcolor='#666').pack(side=tk.LEFT, padx=2)
+        tk.Radiobutton(mark, text="초", variable=self.unit_var,
+                       value="sec", bg='#444', fg='white',
+                       selectcolor='#666').pack(side=tk.LEFT, padx=2)
+        tk.Button(mark, text="추가", command=self._add_segment_manual,
+                  bg='#2196F3', fg='white', width=5).pack(side=tk.LEFT, padx=3)
 
         # 재생 컨트롤 + 프레임 정보
         ctrl = tk.Frame(bottom_fixed, bg='#333')
@@ -1912,11 +1932,13 @@ class VideoTrimmerDialog(tk.Toplevel):
     # ── 구간 선택 ──
 
     def _set_mark_in(self):
+        """현재 프레임을 시작점으로 설정하고 입력창에도 반영."""
         self.mark_in = self.current_frame
-        self.mark_label.config(
-            text=f"시작점: {self._frame_to_time(self.mark_in)}  (F{self.mark_in})")
+        self.in_entry.delete(0, tk.END)
+        self.in_entry.insert(0, str(self.current_frame))
 
     def _add_segment(self):
+        """현재 프레임을 끝점으로, mark_in을 시작점으로 구간 추가."""
         if self.mark_in is None:
             messagebox.showwarning("경고", "먼저 시작점 [I]을 설정하세요.")
             return
@@ -1927,7 +1949,42 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.segments.append((self.mark_in, end))
         self.segments.sort()
         self.mark_in = None
-        self.mark_label.config(text="시작점: —")
+        self._refresh_segments()
+
+    def _parse_time_input(self, text):
+        """입력값을 프레임 번호로 변환.
+        '12345' → 프레임 번호, '01:23.456' → 초→프레임 변환.
+        unit_var에 따라 해석."""
+        text = text.strip()
+        if not text:
+            return None
+        try:
+            if self.unit_var.get() == "sec":
+                # 초 단위: '90.5' 또는 '01:30.5'
+                if ':' in text:
+                    parts = text.split(':')
+                    seconds = float(parts[0]) * 60 + float(parts[1])
+                else:
+                    seconds = float(text)
+                return max(0, int(seconds * self.fps)) if self.fps > 0 else 0
+            else:
+                return max(0, int(float(text)))
+        except ValueError:
+            return None
+
+    def _add_segment_manual(self):
+        """입력창의 시작/끝 값으로 구간 직접 추가."""
+        start = self._parse_time_input(self.in_entry.get())
+        end = self._parse_time_input(self.out_entry.get())
+        if start is None or end is None:
+            messagebox.showwarning("경고", "시작/끝 값을 올바르게 입력하세요.\n"
+                                   "프레임: 12345  |  초: 90.5 또는 01:30.5")
+            return
+        if end <= start:
+            messagebox.showwarning("경고", "끝 값이 시작보다 커야 합니다.")
+            return
+        self.segments.append((start, end))
+        self.segments.sort()
         self._refresh_segments()
 
     def _refresh_segments(self):
