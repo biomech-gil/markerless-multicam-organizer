@@ -2051,95 +2051,81 @@ class VideoTrimmerDialog(tk.Toplevel):
         if not output:
             return
 
-        # timescale 보존 인자
-        ts_args = []
-        if self.timescale:
-            ts_args = ['-video_track_timescale', str(self.timescale)]
+        orig_rate = self.r_frame_rate  # 예: "180000/1001"
 
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
-            # 1단계: 구간 추출
+            # 1단계: 구간별 raw 스트림 추출
             seg_files = []
             for i, (s, e) in enumerate(self.segments):
                 seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
                 ss = s / self.fps if self.fps > 0 else 0
                 duration = (e - s) / self.fps if self.fps > 0 else 0
-                cmd = (['ffmpeg',
-                        '-ss', f'{ss:.6f}',
-                        '-i', self.filepath,
-                        '-t', f'{duration:.6f}',
-                        '-c', 'copy']
-                       + ts_args + ['-y', seg_path])
-                r = subprocess.run(cmd, capture_output=True)
+                r = subprocess.run([
+                    'ffmpeg',
+                    '-ss', f'{ss:.6f}',
+                    '-i', self.filepath,
+                    '-t', f'{duration:.6f}',
+                    '-c', 'copy', '-y', seg_path
+                ], capture_output=True)
                 if r.returncode != 0 or not os.path.exists(seg_path):
-                    # 타이밍 문제일 수 있으므로 미세 조정 후 재시도
-                    duration = max(duration - 0.001, 0.001)
-                    cmd = (['ffmpeg',
-                            '-ss', f'{ss:.6f}',
-                            '-i', self.filepath,
-                            '-t', f'{duration:.6f}',
-                            '-c', 'copy']
-                           + ts_args + ['-y', seg_path])
-                    r = subprocess.run(cmd, capture_output=True)
-                    if r.returncode != 0 or not os.path.exists(seg_path):
-                        messagebox.showerror("오류",
-                            f"구간 {i + 1} 추출 실패:\n"
-                            f"{r.stderr.decode(errors='replace')[:300]}")
-                        return
+                    messagebox.showerror("오류",
+                        f"구간 {i + 1} 추출 실패:\n"
+                        f"{r.stderr.decode(errors='replace')[:300]}")
+                    return
                 seg_files.append(seg_path)
 
-            # 2단계: 병합
+            # 2단계: 병합 (임시)
             list_path = os.path.join(temp_dir, "list.txt")
             with open(list_path, 'w', encoding='utf-8') as f:
                 for p in seg_files:
                     f.write(f"file '{p.replace(os.sep, '/')}'\n")
 
-            concat_path = os.path.join(temp_dir, "concat_out.mp4")
-            cmd = (['ffmpeg', '-f', 'concat', '-safe', '0',
-                    '-i', list_path, '-c', 'copy']
-                   + ts_args + ['-y', concat_path])
-            r = subprocess.run(cmd, capture_output=True)
+            concat_path = os.path.join(temp_dir, "concat_raw.mp4")
+            r = subprocess.run([
+                'ffmpeg', '-f', 'concat', '-safe', '0',
+                '-i', list_path, '-c', 'copy', '-y', concat_path
+            ], capture_output=True)
             if r.returncode != 0:
                 messagebox.showerror("오류",
                     f"병합 실패:\n{r.stderr.decode(errors='replace')[:300]}")
                 return
 
-            # 3단계: fps 검증 + 불일치 시 자동 보정
-            orig_rate = self.r_frame_rate
-            out_rate = self._get_ffprobe_rate(concat_path)
-
-            if orig_rate and out_rate and orig_rate != out_rate:
-                # fps 불일치 → 원본 fps를 강제 주입하는 보정 패스
-                cmd = ['ffmpeg',
-                       '-r', orig_rate,
-                       '-i', concat_path,
-                       '-c', 'copy']
-                if self.timescale:
-                    cmd += ['-video_track_timescale', str(self.timescale)]
-                cmd += ['-y', output]
-                subprocess.run(cmd, capture_output=True)
-
-                # 보정 후 재검증
-                fixed_rate = self._get_ffprobe_rate(output)
-                if fixed_rate != orig_rate:
-                    # 최종 수단: 재인코딩 없이 그냥 복사 (일부 경우 보정됨)
+            # 3단계: 원본 fps를 강제 주입하여 최종 컨테이너 생성
+            # -r 을 입력 옵션으로 → 컨테이너 타이밍을 원본 fps로 재작성
+            if orig_rate:
+                remux_cmd = [
+                    'ffmpeg',
+                    '-r', orig_rate,
+                    '-i', concat_path,
+                    '-c', 'copy',
+                    '-video_track_timescale', str(self.timescale or 90000),
+                    '-y', output
+                ]
+                r = subprocess.run(remux_cmd, capture_output=True)
+                if r.returncode != 0:
+                    # 리먹싱 실패 시 그냥 복사
                     shutil.copy2(concat_path, output)
             else:
                 shutil.copy2(concat_path, output)
 
-            # 최종 결과
+            # 4단계: 최종 검증
             final_rate = self._get_ffprobe_rate(output)
             total_f = sum(e - s for s, e in self.segments)
-            rate_str = final_rate or "확인 불가"
-            match = "일치" if (orig_rate and final_rate == orig_rate) else "확인 필요"
+
+            if orig_rate and final_rate == orig_rate:
+                status = "원본과 정확히 일치"
+            elif orig_rate and final_rate:
+                status = f"불일치! 원본={orig_rate}, 출력={final_rate}"
+            else:
+                status = "검증 생략 (ffprobe 없음)"
 
             messagebox.showinfo("내보내기 완료",
                 f"{output}\n\n"
                 f"{len(self.segments)}개 구간, {total_f}프레임\n"
-                f"원본: {orig_rate or 'N/A'}\n"
-                f"출력: {rate_str}\n"
-                f"상태: {match}")
+                f"r_frame_rate: {final_rate or 'N/A'}\n"
+                f"{status}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
