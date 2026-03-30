@@ -2033,12 +2033,15 @@ class VideoTrimmerDialog(tk.Toplevel):
             return
         idx = sel[0]
         s, e = self.segments[idx]
-        # 입력창에 프레임 값 반영
+        # 입력창에 값 반영 (현재 단위에 맞춰)
         self.in_entry.delete(0, tk.END)
-        self.in_entry.insert(0, str(s))
         self.out_entry.delete(0, tk.END)
-        self.out_entry.insert(0, str(e))
-        self.unit_var.set("frame")
+        if self.unit_var.get() == "sec":
+            self.in_entry.insert(0, f"{s / self.fps:.3f}" if self.fps > 0 else "0")
+            self.out_entry.insert(0, f"{e / self.fps:.3f}" if self.fps > 0 else "0")
+        else:
+            self.in_entry.insert(0, str(s))
+            self.out_entry.insert(0, str(e))
         # 시작 프레임으로 이동
         self._show_frame(s)
 
@@ -2122,17 +2125,13 @@ class VideoTrimmerDialog(tk.Toplevel):
             pass
         return None
 
-    def _export(self):
-        """CRF 0 무손실 재인코딩으로 프레임 정확 커팅 + fps 완벽 보존.
+    def set_label_text(self, text):
+        """진행 상태를 파일 라벨에 표시."""
+        self.file_label.config(text=text)
+        self.update()
 
-        왜 -c copy를 쓰지 않는가:
-        1) -c copy는 키프레임에서만 자를 수 있어 구간 시작이 몇 프레임 앞당겨짐
-        2) -c copy는 MP4 stts box에 비정수 sample_delta를 만들어 fps가 변함
-        CRF 0 재인코딩은 두 문제를 동시에 해결:
-        - 임의 프레임에서 정확히 자름 (키프레임 제약 없음)
-        - -r로 fps를 직접 지정하므로 원본과 100% 동일
-        - CRF 0 = 수학적 무손실 (화질 동일)
-        """
+    def _export(self):
+        """CRF 17 인코딩으로 프레임 정확 커팅 + fps 완벽 보존."""
         if not self.filepath or not self.segments:
             messagebox.showwarning("경고", "파일과 유지 구간을 먼저 지정하세요.")
             return
@@ -2155,27 +2154,34 @@ class VideoTrimmerDialog(tk.Toplevel):
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
-            # 1단계: 각 구간을 CRF 0 무손실 인코딩으로 프레임 정확 추출
-            #   -ss 를 -i 뒤에 배치 → 프레임 단위 정확한 시킹
-            #   -c:v libx264 -crf 0 → 무손실 재인코딩
-            #   -r 원본비율 → 정확한 CFR
+            # 1단계: 각 구간을 CRF 17 인코딩으로 프레임 정확 추출
+            #   -ss를 -i 앞에 배치 → 키프레임으로 빠른 시킹
+            #   + 인코딩 모드 → 키프레임~요청 지점 사이는 디코딩만 하고
+            #     요청 지점부터 정확히 출력 시작 (프레임 정확 + 빠름)
+            #   CRF 17 = 시각적 무손실 (SSIM>0.999), 파일 크기 원본 수준
             seg_files = []
+            total_segs = len(self.segments)
             for i, (s, e) in enumerate(self.segments):
                 seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
                 ss = s / self.fps if self.fps > 0 else 0
                 duration = (e - s) / self.fps if self.fps > 0 else 0
+
+                self.set_label_text(
+                    f"구간 {i + 1}/{total_segs} 인코딩 중... "
+                    f"({self._frame_to_time(s)}~{self._frame_to_time(e)})")
+
                 r = subprocess.run([
                     'ffmpeg',
-                    '-i', self.filepath,
                     '-ss', f'{ss:.6f}',
+                    '-i', self.filepath,
                     '-t', f'{duration:.6f}',
-                    '-c:v', 'libx264', '-crf', '0',
-                    '-preset', 'ultrafast',
+                    '-c:v', 'libx264', '-crf', '17',
+                    '-preset', 'fast',
                     '-r', orig_rate,
                     '-video_track_timescale', str(best_timescale),
                     '-an',
                     '-y', seg_path
-                ], capture_output=True, timeout=600)
+                ], capture_output=True, timeout=1200)
                 if r.returncode != 0 or not os.path.exists(seg_path):
                     messagebox.showerror("오류",
                         f"구간 {i + 1} 인코딩 실패:\n"
@@ -2183,7 +2189,8 @@ class VideoTrimmerDialog(tk.Toplevel):
                     return
                 seg_files.append(seg_path)
 
-            # 2단계: concat으로 병합 (-c copy: 이미 동일 코덱/fps이므로 안전)
+            # 2단계: concat으로 병합
+            self.set_label_text("구간 병합 중...")
             list_path = os.path.join(temp_dir, "list.txt")
             with open(list_path, 'w', encoding='utf-8') as f:
                 for p in seg_files:
