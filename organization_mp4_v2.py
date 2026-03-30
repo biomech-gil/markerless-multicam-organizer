@@ -2022,11 +2022,17 @@ class VideoTrimmerDialog(tk.Toplevel):
             for i, (s, e) in enumerate(self.segments):
                 seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
                 ss = s / self.fps if self.fps > 0 else 0
-                to = e / self.fps if self.fps > 0 else 0
+                duration = (e - s) / self.fps if self.fps > 0 else 0
+                # -ss를 -i 앞에 배치 (입력 시킹: 빠르고 타임스탬프 보존)
+                # -t (구간 길이) 사용 (-to 대신)
                 r = subprocess.run([
-                    'ffmpeg', '-i', self.filepath,
-                    '-ss', f'{ss:.6f}', '-to', f'{to:.6f}',
-                    '-c', 'copy', '-y', seg_path
+                    'ffmpeg',
+                    '-ss', f'{ss:.6f}',
+                    '-i', self.filepath,
+                    '-t', f'{duration:.6f}',
+                    '-c', 'copy',
+                    '-avoid_negative_ts', 'make_zero',
+                    '-y', seg_path
                 ], capture_output=True)
                 if r.returncode != 0 or not os.path.exists(seg_path):
                     messagebox.showerror("오류",
