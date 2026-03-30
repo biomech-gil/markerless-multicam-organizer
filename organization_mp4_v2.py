@@ -717,7 +717,7 @@ class VideoOrganizer:
 class SetGridViewer(tk.Toplevel):
     DECODE_WIDTH = 480  # 디코딩 후 즉시 리사이즈할 최대 폭
 
-    def __init__(self, parent, matched_sets, root_folder=None):
+    def __init__(self, parent, matched_sets, root_folder=None, cam_folders=None):
         super().__init__(parent)
         self.title("세트 프리뷰어 - 프레임 비교")
         # 화면 크기에 맞춰 창 크기 설정 (작업표시줄 고려)
@@ -727,6 +727,7 @@ class SetGridViewer(tk.Toplevel):
         win_h = min(800, screen_h - 80)
         self.geometry(f"{win_w}x{win_h}")
         self.matched_sets = matched_sets
+        self.cam_folders = cam_folders or {}  # {cam: [VideoInfo, ...]}
         self.current_set_idx = 0
         self.current_frame = 0
         self.captures = {}
@@ -736,6 +737,11 @@ class SetGridViewer(tk.Toplevel):
         self.frame_step = 1
         self.step_buttons = {}    # {step_value: Button}
         self.speed_buttons = {}   # {ms_value: Button}
+
+        # 카메라별 파일 선택 UI
+        self.file_combos = {}     # {cam: Combobox}
+        self.file_maps = {}       # {cam: {display_str: VideoInfo}}
+        self._set_modified = False
 
         # 병렬 디코딩 & 프리페치
         self.decode_executor = None
@@ -764,13 +770,31 @@ class SetGridViewer(tk.Toplevel):
         top = tk.Frame(self, bg='#333')
         top.pack(fill=tk.X)
 
-        tk.Button(top, text="◀◀ 이전 세트", command=self._prev_set,
-                  bg='#555', fg='white', width=12).pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(top, text="◀◀", command=self._prev_set,
+                  bg='#555', fg='white', width=5).pack(side=tk.LEFT, padx=3, pady=5)
+
+        # 세트 번호 직접 이동
+        self.set_spin_var = tk.IntVar(value=1)
+        self.set_spin = tk.Spinbox(
+            top, from_=1, to=max(len(matched_sets), 1), width=5,
+            textvariable=self.set_spin_var, bg='#444', fg='white',
+            font=('Arial', 12, 'bold'))
+        self.set_spin.pack(side=tk.LEFT, padx=2, pady=5)
+        self.set_spin.bind('<Return>', lambda e: self._goto_set())
+        tk.Button(top, text="이동", command=self._goto_set,
+                  bg='#555', fg='white', width=4).pack(side=tk.LEFT, padx=2)
+
         self.set_label = tk.Label(top, text="", bg='#333', fg='white',
-                                  font=('Arial', 14, 'bold'))
+                                  font=('Arial', 12, 'bold'))
         self.set_label.pack(side=tk.LEFT, expand=True)
-        tk.Button(top, text="다음 세트 ▶▶", command=self._next_set,
-                  bg='#555', fg='white', width=12).pack(side=tk.RIGHT, padx=5, pady=5)
+
+        # 수정 반영 버튼
+        self.apply_btn = tk.Button(top, text="수정 반영", command=self._apply_changes,
+                                   bg='#FF5722', fg='white', width=8,
+                                   state=tk.DISABLED)
+        self.apply_btn.pack(side=tk.RIGHT, padx=5, pady=5)
+        tk.Button(top, text="▶▶", command=self._next_set,
+                  bg='#555', fg='white', width=5).pack(side=tk.RIGHT, padx=3, pady=5)
 
         # 영상 그리드 + 하단 컨트롤 (PanedWindow: 드래그로 비율 조절 가능)
         self.viewer_paned = tk.PanedWindow(self, orient=tk.VERTICAL,
@@ -865,6 +889,7 @@ class SetGridViewer(tk.Toplevel):
             return
 
         self.current_set_idx = idx
+        self.set_spin_var.set(idx + 1)
         self.current_frame = 0
         set_name, cam_dict = self.matched_sets[idx]
 
@@ -903,6 +928,10 @@ class SetGridViewer(tk.Toplevel):
 
         self.grid_labels = {}
         self.grid_name_labels = {}
+        self.file_combos = {}
+        self.file_maps = {}
+        self._set_modified = False
+        self.apply_btn.config(state=tk.DISABLED)
 
         for i, cam in enumerate(self.cam_names):
             r, c = divmod(i, cols)
@@ -918,6 +947,28 @@ class SetGridViewer(tk.Toplevel):
             img_lbl = tk.Label(cell, bg='black', text='로딩 중...', fg='gray')
             img_lbl.pack(fill=tk.BOTH, expand=True)
             self.grid_labels[cam] = img_lbl
+
+            # 파일 선택 Combobox (cam_folders가 있을 때만)
+            if cam in self.cam_folders:
+                self.file_maps[cam] = {}
+                display_list = []
+                current_display = ""
+                for v in self.cam_folders[cam]:
+                    display = f"{v.filename}  ({v.duration:.2f}s)"
+                    display_list.append(display)
+                    self.file_maps[cam][display] = v
+                    if v.filepath == video.filepath:
+                        current_display = display
+
+                combo = ttk.Combobox(cell, values=display_list,
+                                     state='readonly', width=40,
+                                     font=('Arial', 8))
+                if current_display:
+                    combo.set(current_display)
+                combo.pack(fill=tk.X, padx=2, pady=(0, 2))
+                combo.bind('<<ComboboxSelected>>',
+                           lambda e, c=cam: self._on_file_change(c))
+                self.file_combos[cam] = combo
 
         for c in range(cols):
             self.grid_frame.columnconfigure(c, weight=1)
@@ -1182,6 +1233,74 @@ class SetGridViewer(tk.Toplevel):
         self.play_speed = ms
         for m, btn in self.speed_buttons.items():
             btn.config(bg='#2196F3' if m == ms else '#555')
+
+    # ── 세트 이동 & 파일 변경 ──
+
+    def _goto_set(self):
+        """Spinbox 값으로 세트 이동."""
+        try:
+            idx = self.set_spin_var.get() - 1
+        except (tk.TclError, ValueError):
+            return
+        if 0 <= idx < len(self.matched_sets):
+            self._load_set(idx)
+
+    def _on_file_change(self, cam):
+        """카메라의 파일을 변경하고 프리뷰를 갱신한다 (임시 변경)."""
+        combo = self.file_combos.get(cam)
+        if not combo:
+            return
+        selected = combo.get()
+        new_video = self.file_maps.get(cam, {}).get(selected)
+        if not new_video:
+            return
+
+        self._wait_for_pending_decode()
+
+        # 캡처 교체
+        old_cap = self.captures.get(cam)
+        if old_cap:
+            old_cap.release()
+        cap = cv2.VideoCapture(new_video.filepath)
+        self.captures[cam] = cap
+
+        # 이름 라벨 갱신
+        self.grid_name_labels[cam].config(
+            text=f"{cam}: {new_video.filename} ({new_video.duration:.2f}s)")
+
+        # 프레임 카운트 갱신
+        fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fc - 1 > self.max_frames:
+            self.max_frames = fc - 1
+            self.frame_slider.config(to=self.max_frames)
+
+        # 수정 플래그
+        self._set_modified = True
+        self.apply_btn.config(state=tk.NORMAL)
+
+        # 현재 프레임 새로 디코딩
+        self._cam_next_frame[cam] = -1
+        self._show_frame(self.current_frame)
+
+    def _apply_changes(self):
+        """현재 세트의 파일 변경을 matched_sets에 확정 반영한다."""
+        if not self._set_modified:
+            return
+
+        idx = self.current_set_idx
+        set_name, cam_dict = self.matched_sets[idx]
+
+        # 콤보박스 선택에 따라 cam_dict 갱신
+        for cam, combo in self.file_combos.items():
+            selected = combo.get()
+            new_video = self.file_maps.get(cam, {}).get(selected)
+            if new_video:
+                cam_dict[cam] = new_video
+
+        self._set_modified = False
+        self.apply_btn.config(state=tk.DISABLED)
+        self.set_label.config(
+            text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)})  반영 완료!")
 
     def _prev_set(self):
         if self.current_set_idx > 0:
@@ -1657,7 +1776,8 @@ class VideoOrganizerGUI:
             return
         idx = int(selection[0])
         if 0 <= idx < len(self.matcher.matched_sets):
-            SetGridViewer(self.root, [self.matcher.matched_sets[idx]])
+            SetGridViewer(self.root, [self.matcher.matched_sets[idx]],
+                         cam_folders=self.matcher.cam_folders)
 
     def _preview_selected_sets(self):
         """선택된 세트들만 프리뷰"""
@@ -1670,14 +1790,16 @@ class VideoOrganizerGUI:
         selected_sets = [self.matcher.matched_sets[i] for i in indices
                          if 0 <= i < len(self.matcher.matched_sets)]
         if selected_sets:
-            SetGridViewer(self.root, selected_sets)
+            SetGridViewer(self.root, selected_sets,
+                         cam_folders=self.matcher.cam_folders)
 
     def _preview_all_sets(self):
         """전체 세트 프리뷰"""
         if not self.matcher.matched_sets:
             messagebox.showwarning("경고", "먼저 Step 1 (스캔 & 매칭)을 실행하세요.")
             return
-        SetGridViewer(self.root, self.matcher.matched_sets)
+        SetGridViewer(self.root, self.matcher.matched_sets,
+                     cam_folders=self.matcher.cam_folders)
 
     # ── 폴더 선택 ──
     def select_folder(self):
