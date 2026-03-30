@@ -1329,6 +1329,20 @@ class CalibrationDialog(tk.Toplevel):
                       "동기화 매칭은 C0002부터 시작.",
                  bg='#333', fg='#aaa').pack(pady=(0, 6))
 
+        # 하단 버튼 (먼저 pack하여 항상 표시)
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+
+        tk.Button(btn_frame, text="확인", command=self._confirm,
+                  width=12, height=2, bg='#4CAF50', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="해제", command=self._clear,
+                  width=12, height=2, bg='#FF9800', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="취소", command=self._cancel,
+                  width=12, height=2, bg='#f44336', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+
         # 카메라 그리드
         cam_names = sorted(self.cam_folders.keys(), key=natural_sort_key)
         n = len(cam_names)
@@ -1382,20 +1396,6 @@ class CalibrationDialog(tk.Toplevel):
             combo.bind('<<ComboboxSelected>>',
                        lambda e, cn=cam_name: self._update_preview(cn))
             self.combos[cam_name] = combo
-
-        # 하단 버튼
-        btn_frame = tk.Frame(self)
-        btn_frame.pack(pady=10)
-
-        tk.Button(btn_frame, text="확인", command=self._confirm,
-                  width=12, height=2, bg='#4CAF50', fg='white'
-                  ).pack(side=tk.LEFT, padx=10)
-        tk.Button(btn_frame, text="해제", command=self._clear,
-                  width=12, height=2, bg='#FF9800', fg='white'
-                  ).pack(side=tk.LEFT, padx=10)
-        tk.Button(btn_frame, text="취소", command=self._cancel,
-                  width=12, height=2, bg='#f44336', fg='white'
-                  ).pack(side=tk.LEFT, padx=10)
 
     # ── 프리뷰 ──
 
