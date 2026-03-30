@@ -1864,11 +1864,31 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.mark_in = None
         self.seg_listbox.delete(0, tk.END)
 
+        # ffprobe로 정확한 fps 비율 + timescale 감지
+        self.r_frame_rate = None   # "180000/1001" 같은 정확한 비율
+        self.timescale = None
+        try:
+            r = subprocess.run([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=r_frame_rate',
+                '-of', 'csv=p=0', filepath
+            ], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                rate = r.stdout.strip().split('\n')[0]
+                if '/' in rate:
+                    num, den = map(int, rate.split('/'))
+                    self.r_frame_rate = rate
+                    self.timescale = num
+                    self.fps = num / den  # OpenCV보다 정확한 fps
+        except (FileNotFoundError, Exception):
+            pass
+
         w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps_display = self.r_frame_rate or f"{self.fps:.3f}"
         self.file_label.config(
             text=f"{os.path.basename(filepath)}  |  {w}x{h}  |  "
-                 f"{self.fps:.1f}fps  |  {self.frame_count}f")
+                 f"{fps_display} fps  |  {self.frame_count}f")
         self.frame_slider.config(to=max(self.frame_count - 1, 0))
         self._show_frame(0)
 
@@ -1991,9 +2011,11 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.seg_listbox.delete(0, tk.END)
         for i, (s, e) in enumerate(self.segments):
             dur = (e - s) / self.fps if self.fps > 0 else 0
+            ss = s / self.fps if self.fps > 0 else 0
+            se = e / self.fps if self.fps > 0 else 0
             self.seg_listbox.insert(tk.END,
-                f"  {i + 1}.  {self._frame_to_time(s)} ~ "
-                f"{self._frame_to_time(e)}   ({dur:.1f}초, {e - s}프레임)")
+                f"  {i + 1}.  F{s}~F{e} ({e - s}f)  |  "
+                f"{ss:.3f}s~{se:.3f}s ({dur:.3f}s)")
 
     def _delete_segment(self):
         sel = self.seg_listbox.curselection()
@@ -2002,6 +2024,24 @@ class VideoTrimmerDialog(tk.Toplevel):
             self._refresh_segments()
 
     # ── 내보내기 ──
+
+    def _get_ffprobe_fps(self, filepath):
+        """ffprobe로 r_frame_rate를 읽어 정확한 fps float를 반환."""
+        try:
+            r = subprocess.run([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=r_frame_rate',
+                '-of', 'csv=p=0', filepath
+            ], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                rate = r.stdout.strip().split('\n')[0]
+                if '/' in rate:
+                    num, den = map(int, rate.split('/'))
+                    return num / den
+                return float(rate)
+        except Exception:
+            pass
+        return None
 
     def _export(self):
         if not self.filepath or not self.segments:
@@ -2015,6 +2055,11 @@ class VideoTrimmerDialog(tk.Toplevel):
         if not output:
             return
 
+        # timescale 강제 설정 인자 (원본과 동일한 시간 기준 유지)
+        ts_args = []
+        if self.timescale:
+            ts_args = ['-video_track_timescale', str(self.timescale)]
+
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
@@ -2023,17 +2068,15 @@ class VideoTrimmerDialog(tk.Toplevel):
                 seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
                 ss = s / self.fps if self.fps > 0 else 0
                 duration = (e - s) / self.fps if self.fps > 0 else 0
-                # -ss를 -i 앞에 배치 (입력 시킹: 빠르고 타임스탬프 보존)
-                # -t (구간 길이) 사용 (-to 대신)
-                r = subprocess.run([
+                cmd = ([
                     'ffmpeg',
                     '-ss', f'{ss:.6f}',
                     '-i', self.filepath,
                     '-t', f'{duration:.6f}',
                     '-c', 'copy',
-                    '-avoid_negative_ts', 'make_zero',
-                    '-y', seg_path
-                ], capture_output=True)
+                    '-avoid_negative_ts', 'make_zero']
+                    + ts_args + ['-y', seg_path])
+                r = subprocess.run(cmd, capture_output=True)
                 if r.returncode != 0 or not os.path.exists(seg_path):
                     messagebox.showerror("오류",
                         f"구간 {i + 1} 추출 실패:\n"
@@ -2046,20 +2089,42 @@ class VideoTrimmerDialog(tk.Toplevel):
                 for p in seg_files:
                     f.write(f"file '{p.replace(os.sep, '/')}'\n")
 
-            r = subprocess.run([
+            cmd = ([
                 'ffmpeg', '-f', 'concat', '-safe', '0',
-                '-i', list_path, '-c', 'copy', '-y', output
-            ], capture_output=True)
+                '-i', list_path, '-c', 'copy']
+                + ts_args + ['-y', output])
+            r = subprocess.run(cmd, capture_output=True)
 
-            if r.returncode == 0:
-                total_f = sum(e - s for s, e in self.segments)
+            if r.returncode != 0:
+                messagebox.showerror("오류",
+                    f"병합 실패:\n{r.stderr.decode(errors='replace')[:500]}")
+                return
+
+            # ── 사후 검증: fps 일치 확인 ──
+            out_fps = self._get_ffprobe_fps(output)
+            total_f = sum(e - s for s, e in self.segments)
+            fps_ok = True
+            fps_msg = ""
+
+            if out_fps is not None:
+                diff = abs(out_fps - self.fps)
+                if diff > 0.01:
+                    fps_ok = False
+                    fps_msg = (f"\n\n⚠ fps 불일치!\n"
+                               f"  원본: {self.fps:.6f}\n"
+                               f"  내보낸: {out_fps:.6f}\n"
+                               f"  차이: {diff:.6f}")
+
+            if fps_ok:
                 messagebox.showinfo("완료",
                     f"내보내기 완료!\n{output}\n\n"
                     f"{len(self.segments)}개 구간, {total_f}프레임\n"
-                    f"fps·해상도·코덱 원본과 동일")
+                    f"fps: {self.fps:.6f} (원본과 동일 확인)")
             else:
-                messagebox.showerror("오류",
-                    f"병합 실패:\n{r.stderr.decode(errors='replace')[:500]}")
+                messagebox.showwarning("완료 (fps 경고)",
+                    f"내보내기 완료!\n{output}\n\n"
+                    f"{len(self.segments)}개 구간, {total_f}프레임"
+                    f"{fps_msg}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
