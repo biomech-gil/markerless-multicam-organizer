@@ -9,6 +9,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 
 
 # ─────────────────────────────────────────────
@@ -77,7 +78,192 @@ def zcam_sort_key(filename):
 
 
 # ─────────────────────────────────────────────
-# 3. SetMatcher: 세트 매칭 엔진
+# 3. FileHistoryManager: 파일 변경 이력 관리
+# ─────────────────────────────────────────────
+class FileHistoryManager:
+    """파일 변경 이력을 영구 저장하여 최초 원본 상태로 복원을 지원한다.
+
+    .file_history/original_state.json:
+        {cam_folder: {현재파일명: {original_filename, duration, ...}}}
+        - 키(현재파일명)는 리네임 시 갱신되지만, original_filename은 절대 변경되지 않음
+
+    .file_history/change_log.json:
+        [{timestamp, cam, from, to}, ...]  변경 이력 전체 기록
+    """
+
+    HISTORY_DIR = ".file_history"
+    ORIGINAL_STATE_FILE = "original_state.json"
+    CHANGE_LOG_FILE = "change_log.json"
+
+    def __init__(self, root_folder):
+        self.root_folder = root_folder
+        self.history_dir = os.path.join(root_folder, self.HISTORY_DIR)
+        self.original_state_path = os.path.join(self.history_dir, self.ORIGINAL_STATE_FILE)
+        self.change_log_path = os.path.join(self.history_dir, self.CHANGE_LOG_FILE)
+        self.original_state = {}   # {cam: {current_filename: {original_filename, ...}}}
+        self.change_log = []       # [{timestamp, cam, from, to}, ...]
+        self._ensure_history_dir()
+        self._load()
+
+    def _ensure_history_dir(self):
+        os.makedirs(self.history_dir, exist_ok=True)
+
+    def _load(self):
+        if os.path.exists(self.original_state_path):
+            with open(self.original_state_path, 'r', encoding='utf-8') as f:
+                self.original_state = json.load(f)
+        if os.path.exists(self.change_log_path):
+            with open(self.change_log_path, 'r', encoding='utf-8') as f:
+                self.change_log = json.load(f)
+
+    def _save(self):
+        with open(self.original_state_path, 'w', encoding='utf-8') as f:
+            json.dump(self.original_state, f, ensure_ascii=False, indent=2)
+        with open(self.change_log_path, 'w', encoding='utf-8') as f:
+            json.dump(self.change_log, f, ensure_ascii=False, indent=2)
+
+    def has_history(self):
+        return bool(self.original_state)
+
+    def capture_initial_state(self, cam_folders):
+        """최초 스캔 시 원본 상태를 캡처한다. 이미 이력이 있으면 건너뛴다."""
+        if self.has_history():
+            return False
+        for cam_name, videos in cam_folders.items():
+            self.original_state[cam_name] = {}
+            for video in videos:
+                self.original_state[cam_name][video.filename] = {
+                    'original_filename': video.filename,
+                    'duration': round(video.duration, 3),
+                    'frame_count': video.frame_count,
+                    'fps': round(video.fps, 2),
+                    'resolution': f"{video.width}x{video.height}",
+                }
+        self._save()
+        return True
+
+    def record_renames(self, rename_log):
+        """execute_rename이 반환한 rename_log를 받아 이력을 갱신한다."""
+        timestamp = datetime.now().isoformat()
+        for entry in rename_log:
+            cam = entry['cam']
+            old = entry['old']
+            new = entry['new']
+            if old == new:
+                continue
+            if cam in self.original_state and old in self.original_state[cam]:
+                info = self.original_state[cam].pop(old)
+                self.original_state[cam][new] = info
+                self.change_log.append({
+                    'timestamp': timestamp,
+                    'cam': cam,
+                    'from': old,
+                    'to': new,
+                })
+        self._save()
+
+    def get_restore_plan(self):
+        """원본 복원 계획 반환: 현재 파일명 ≠ 원본 파일명인 항목만."""
+        plan = []
+        for cam_name, files in self.original_state.items():
+            cam_dir = os.path.join(self.root_folder, cam_name)
+            for current_filename, info in files.items():
+                original_filename = info['original_filename']
+                if current_filename != original_filename:
+                    plan.append({
+                        'cam': cam_name,
+                        'dir': cam_dir,
+                        'current': current_filename,
+                        'original': original_filename,
+                        'metadata': info,
+                    })
+        return plan
+
+    def restore_to_original(self, progress_callback=None):
+        """모든 파일을 최초 원본 상태로 복원한다."""
+        plan = self.get_restore_plan()
+        if not plan:
+            return 0, ["복원할 파일이 없습니다. (이미 원본 상태)"]
+
+        success = 0
+        errors = []
+        total = len(plan)
+
+        # 충돌 방지: 현재 → 임시 → 원본
+        temp_plans = []
+        for idx, item in enumerate(plan):
+            temp_name = f"__temp_restore_{idx}__.mp4"
+            temp_path = os.path.join(item['dir'], temp_name)
+            temp_plans.append(temp_path)
+
+        # 1차: 현재 → 임시
+        for idx, item in enumerate(plan):
+            if progress_callback:
+                progress_callback(idx + 1, total * 2,
+                                  f"임시 변경: {item['current']}")
+            current_path = os.path.join(item['dir'], item['current'])
+            if not os.path.exists(current_path):
+                errors.append(f"{item['cam']}/{item['current']}: 파일을 찾을 수 없음")
+                temp_plans[idx] = None
+                continue
+            try:
+                os.rename(current_path, temp_plans[idx])
+            except Exception as e:
+                errors.append(f"{item['current']}: {e}")
+                temp_plans[idx] = None
+
+        # 2차: 임시 → 원본
+        timestamp = datetime.now().isoformat()
+        for idx, item in enumerate(plan):
+            if progress_callback:
+                progress_callback(total + idx + 1, total * 2,
+                                  f"복원: {item['original']}")
+            if temp_plans[idx] is None:
+                continue
+            original_path = os.path.join(item['dir'], item['original'])
+            try:
+                os.rename(temp_plans[idx], original_path)
+                success += 1
+                # 매핑 갱신: 키를 원본 파일명으로 되돌림
+                cam_state = self.original_state[item['cam']]
+                info = cam_state.pop(item['current'])
+                cam_state[item['original']] = info
+                self.change_log.append({
+                    'timestamp': timestamp,
+                    'cam': item['cam'],
+                    'from': item['current'],
+                    'to': item['original'],
+                    'action': 'restore',
+                })
+            except Exception as e:
+                errors.append(f"{item['original']}: {e}")
+                try:
+                    os.rename(temp_plans[idx],
+                              os.path.join(item['dir'], item['current']))
+                except:
+                    pass
+
+        self._save()
+        return success, errors
+
+    def get_change_summary(self):
+        """변경 이력 요약 반환."""
+        changed_count = 0
+        total_files = 0
+        for files in self.original_state.values():
+            for current, info in files.items():
+                total_files += 1
+                if current != info['original_filename']:
+                    changed_count += 1
+        return {
+            'total_files': total_files,
+            'changed_files': changed_count,
+            'total_changes': len(self.change_log),
+        }
+
+
+# ─────────────────────────────────────────────
+# 4. SetMatcher: 세트 매칭 엔진
 # ─────────────────────────────────────────────
 class SetMatcher:
     def __init__(self, duration_tolerance=0.5):
@@ -91,6 +277,7 @@ class SetMatcher:
         subfolders = sorted([
             d for d in os.listdir(root_folder)
             if os.path.isdir(os.path.join(root_folder, d))
+            and d != FileHistoryManager.HISTORY_DIR
         ], key=natural_sort_key)
 
         all_files = []
@@ -270,16 +457,7 @@ class SetMatcher:
                 except:
                     pass
 
-        # 리네임 로그 저장 (되돌리기용)
-        if rename_log:
-            log_path = os.path.join(root_folder, "rename_log.json")
-            try:
-                with open(log_path, 'w', encoding='utf-8') as f:
-                    json.dump(rename_log, f, ensure_ascii=False, indent=2)
-            except:
-                pass
-
-        return success, errors
+        return success, errors, rename_log
 
     @staticmethod
     def undo_rename(root_folder, progress_callback=None):
@@ -1007,6 +1185,7 @@ class VideoOrganizerGUI:
 
         self.organizer = VideoOrganizer()
         self.matcher = SetMatcher()
+        self.history_manager = None
         self.video_files = []
         self.set_table_visible = False
 
@@ -1063,7 +1242,7 @@ class VideoOrganizerGUI:
                   width=15, height=2, bg='#E91E63', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="3. 리네임", command=self.step3_rename,
                   width=15, height=2, bg='#9C27B0', fg='white').pack(side=tk.LEFT, padx=3)
-        tk.Button(control_frame, text="되돌리기", command=self.undo_rename,
+        tk.Button(control_frame, text="원본 복원", command=self.restore_original,
                   width=10, height=2, bg='#795548', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="4. 분석", command=self.step4_analyze,
                   width=15, height=2, bg='#FF9800', fg='white').pack(side=tk.LEFT, padx=3)
@@ -1197,8 +1376,20 @@ class VideoOrganizerGUI:
             self.folder_label.config(text=folder)
             self.organizer.root_folder = folder
 
+            # 히스토리 매니저 초기화 (디스크에서 기존 이력 자동 로드)
+            self.history_manager = FileHistoryManager(folder)
+
             self.result_text.delete(1.0, tk.END)
             self.result_text.insert(tk.END, f"선택된 폴더: {folder}\n\n", 'header')
+
+            # 기존 이력이 있으면 상태 표시
+            if self.history_manager.has_history():
+                summary = self.history_manager.get_change_summary()
+                self.result_text.insert(tk.END,
+                    f"[이력 감지] 원본 이력 존재: "
+                    f"총 {summary['total_files']}개 파일 추적 중, "
+                    f"{summary['changed_files']}개 변경됨, "
+                    f"{summary['total_changes']}회 변경 기록\n\n", 'info')
 
             # 세트 테이블 초기화
             for item in self.set_tree.get_children():
@@ -1208,6 +1399,7 @@ class VideoOrganizerGUI:
             subfolders = sorted([
                 d for d in os.listdir(folder)
                 if os.path.isdir(os.path.join(folder, d))
+                and d != FileHistoryManager.HISTORY_DIR
             ], key=natural_sort_key)
 
             self.result_text.insert(tk.END, f"발견된 카메라 폴더: {len(subfolders)}개\n", 'info')
@@ -1244,6 +1436,18 @@ class VideoOrganizerGUI:
         if not cam_folders:
             self.result_text.insert(tk.END, "\nMP4 파일이 있는 하위 폴더를 찾지 못했습니다.\n", 'error')
             return
+
+        # 원본 스냅샷 캡처 (최초 1회만 — 이후에는 기존 이력 유지)
+        if self.history_manager:
+            was_new = self.history_manager.capture_initial_state(cam_folders)
+            if was_new:
+                self.result_text.insert(tk.END,
+                    "\n원본 상태 스냅샷 저장 완료 (.file_history/)\n", 'ok')
+            else:
+                summary = self.history_manager.get_change_summary()
+                self.result_text.insert(tk.END,
+                    f"\n기존 원본 이력 사용 중 "
+                    f"({summary['changed_files']}개 파일 변경됨)\n", 'info')
 
         for cam, videos in sorted(cam_folders.items(), key=lambda x: natural_sort_key(x[0])):
             self.result_text.insert(tk.END, f"\n  {cam}: {len(videos)}개 영상\n", 'info')
@@ -1316,8 +1520,12 @@ class VideoOrganizerGUI:
             self.result_text.insert(tk.END, "Step 3: 리네임 실행 중...\n\n", 'header')
             self.root.update_idletasks()
 
-            success, errors = self.matcher.execute_rename(
+            success, errors, rename_log = self.matcher.execute_rename(
                 plan, self.organizer.root_folder, self.update_progress)
+
+            # 히스토리에 변경 기록
+            if self.history_manager and rename_log:
+                self.history_manager.record_renames(rename_log)
 
             self.result_text.insert(tk.END, f"리네임 완료: 성공 {success}개\n", 'ok')
             if errors:
@@ -1329,38 +1537,56 @@ class VideoOrganizerGUI:
         else:
             self.result_text.insert(tk.END, "\n리네임이 취소되었습니다.\n", 'warning')
 
-    # ── 리네임 되돌리기 ──
-    def undo_rename(self):
+    # ── 원본 복원 ──
+    def restore_original(self):
         folder = self.organizer.root_folder
         if not folder or not os.path.isdir(folder):
             messagebox.showwarning("경고", "먼저 폴더를 선택하세요.")
             return
 
-        log_path = os.path.join(folder, "rename_log.json")
-        if not os.path.exists(log_path):
+        if not self.history_manager or not self.history_manager.has_history():
             messagebox.showwarning("경고",
-                "rename_log.json을 찾을 수 없습니다.\n"
-                "리네임 로그가 없으면 되돌릴 수 없습니다.")
+                "원본 이력이 없습니다.\n"
+                "먼저 스캔(Step 1)을 실행하여 원본 상태를 기록하세요.")
             return
 
-        resp = messagebox.askyesno("확인",
-            "리네임을 되돌려 원본 파일명으로 복원합니다.\n진행하시겠습니까?")
+        summary = self.history_manager.get_change_summary()
+        if summary['changed_files'] == 0:
+            messagebox.showinfo("정보", "모든 파일이 이미 원본 상태입니다.")
+            return
+
+        # 복원 계획 미리보기
+        plan = self.history_manager.get_restore_plan()
+        preview_lines = []
+        for item in plan[:20]:
+            preview_lines.append(
+                f"  {item['cam']}/{item['current']}  →  {item['original']}")
+        if len(plan) > 20:
+            preview_lines.append(f"  ... 외 {len(plan) - 20}개")
+
+        resp = messagebox.askyesno("원본 복원",
+            f"총 {summary['changed_files']}개 파일을 최초 원본 파일명으로 복원합니다.\n"
+            f"(변경 이력: {summary['total_changes']}회)\n\n"
+            + "\n".join(preview_lines) + "\n\n"
+            "진행하시겠습니까?")
         if not resp:
             return
 
         self.result_text.delete(1.0, tk.END)
-        self.result_text.insert(tk.END, "리네임 되돌리기 실행 중...\n\n", 'header')
+        self.result_text.insert(tk.END, "원본 복원 실행 중...\n\n", 'header')
         self.root.update_idletasks()
 
-        success, errors = SetMatcher.undo_rename(folder, self.update_progress)
+        success, errors = self.history_manager.restore_to_original(
+            self.update_progress)
 
-        self.result_text.insert(tk.END, f"복원 완료: 성공 {success}개\n", 'ok')
+        self.result_text.insert(tk.END, f"원본 복원 완료: 성공 {success}개\n", 'ok')
         if errors:
             self.result_text.insert(tk.END, f"오류 {len(errors)}개:\n", 'error')
             for err in errors:
                 self.result_text.insert(tk.END, f"  {err}\n", 'error')
 
-        self.progress_var.set(f"복원 완료: 성공 {success}개, 오류 {len(errors)}개")
+        self.progress_var.set(
+            f"원본 복원 완료: 성공 {success}개, 오류 {len(errors)}개")
 
     # ── Step 4: 분석 ──
     def step4_analyze(self):
