@@ -59,10 +59,21 @@ class VideoInfo:
 
 
 # ─────────────────────────────────────────────
-# 2. Natural Sort 유틸리티
+# 2. 정렬 유틸리티
 # ─────────────────────────────────────────────
 def natural_sort_key(s):
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r'(\d+)', s)]
+
+
+def zcam_sort_key(filename):
+    """ZCAM 파일명에서 CNNNN 시퀀스 번호를 추출하여 정렬 키로 사용.
+    예: 'H001C0023_21000221131242_0001.mp4' -> C0023 -> 23
+    패턴 불일치 시 natural_sort_key로 폴백.
+    """
+    m = re.match(r'[A-Za-z]\d{3}C(\d+)', filename)
+    if m:
+        return (0, int(m.group(1)), filename)
+    return (1, 0, natural_sort_key(filename))
 
 
 # ─────────────────────────────────────────────
@@ -88,7 +99,7 @@ class SetMatcher:
             mp4s = sorted([
                 f for f in os.listdir(cam_path)
                 if f.lower().endswith('.mp4')
-            ], key=natural_sort_key)
+            ], key=zcam_sort_key)
 
             if not mp4s:
                 continue
