@@ -1194,51 +1194,79 @@ class RenamePlanDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
-# 8. CalibrationDialog: 캘리브레이션 영상 지정
+# 8. CalibrationDialog: 캘리브레이션 영상 지정 (프리뷰 포함)
 # ─────────────────────────────────────────────
 class CalibrationDialog(tk.Toplevel):
-    """각 카메라 폴더에서 렌즈 캘리브레이션 영상 1개를 선택하는 다이얼로그."""
+    """각 카메라 폴더에서 렌즈 캘리브레이션 영상 1개를 선택하고
+    첫 프레임 프리뷰로 확인하는 다이얼로그."""
 
     def __init__(self, parent, cam_folders, current_calibration=None):
         super().__init__(parent)
-        self.title("캘리브레이션 영상 지정")
-        self.geometry("700x400")
+        self.title("캘리브레이션 영상 지정 — C0001")
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        win_w = min(1200, screen_w - 40)
+        win_h = min(750, screen_h - 80)
+        self.geometry(f"{win_w}x{win_h}")
+
         self.result = None  # None=취소, {}=해제, {cam:VideoInfo}=지정
         self.cam_folders = cam_folders
         self.current_calibration = current_calibration or {}
         self.combos = {}
-        self.video_maps = {}  # {cam: {display_str: VideoInfo}}
+        self.video_maps = {}       # {cam: {display_str: VideoInfo}}
+        self.preview_labels = {}   # {cam: Label}
+        self.photo_images = []     # GC 방지
+
         self.transient(parent)
         self.grab_set()
         self._setup_ui()
+
+        # 초기 프리뷰 로드
+        self.after(50, self._load_all_previews)
         self.wait_window(self)
 
     def _setup_ui(self):
-        tk.Label(self,
+        # 상단 안내
+        header = tk.Frame(self, bg='#333')
+        header.pack(fill=tk.X)
+        tk.Label(header,
                  text="각 카메라에서 렌즈 캘리브레이션 영상을 선택하세요",
-                 font=('Arial', 11, 'bold')).pack(pady=10, padx=10)
-        tk.Label(self,
-                 text="선택된 영상은 C0001로 지정되며, 동기화 매칭은 C0002부터 시작됩니다.",
-                 fg='gray').pack(padx=10)
+                 font=('Arial', 11, 'bold'), bg='#333', fg='white'
+                 ).pack(pady=6)
+        tk.Label(header,
+                 text="선택된 영상은 C0001로 지정됩니다.  "
+                      "동기화 매칭은 C0002부터 시작.",
+                 bg='#333', fg='#aaa').pack(pady=(0, 6))
 
-        # 스크롤 가능한 프레임
-        canvas = tk.Canvas(self)
-        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
-        inner = tk.Frame(canvas)
-        inner.bind('<Configure>',
-                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
-        canvas.create_window((0, 0), window=inner, anchor='nw')
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=10)
+        # 카메라 그리드
+        cam_names = sorted(self.cam_folders.keys(), key=natural_sort_key)
+        n = len(cam_names)
+        cols = min(n, 3)
+        rows = math.ceil(n / cols)
 
-        for cam_name in sorted(self.cam_folders.keys(), key=natural_sort_key):
-            row = tk.Frame(inner)
-            row.pack(fill=tk.X, pady=4)
+        grid_frame = tk.Frame(self, bg='black')
+        grid_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-            tk.Label(row, text=f"{cam_name}:", width=10, anchor='w',
-                     font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
+        for c in range(cols):
+            grid_frame.columnconfigure(c, weight=1)
+        for r in range(rows):
+            grid_frame.rowconfigure(r, weight=1)
 
+        for i, cam_name in enumerate(cam_names):
+            r, c = divmod(i, cols)
+
+            cell = tk.LabelFrame(grid_frame, text=cam_name,
+                                 font=('Arial', 10, 'bold'),
+                                 bg='#222', fg='white')
+            cell.grid(row=r, column=c, padx=4, pady=4, sticky='nsew')
+
+            # 프리뷰 이미지
+            preview_lbl = tk.Label(cell, bg='black', text='로딩 중...',
+                                   fg='gray', anchor='center')
+            preview_lbl.pack(fill=tk.BOTH, expand=True, padx=3, pady=3)
+            self.preview_labels[cam_name] = preview_lbl
+
+            # 콤보박스
             videos = self.cam_folders[cam_name]
             self.video_maps[cam_name] = {}
             display_list = []
@@ -1247,9 +1275,9 @@ class CalibrationDialog(tk.Toplevel):
                 display_list.append(display)
                 self.video_maps[cam_name][display] = v
 
-            combo = ttk.Combobox(row, values=display_list,
-                                 state='readonly', width=55)
-            # 기존 선택이 있으면 해당 항목으로 설정
+            combo = ttk.Combobox(cell, values=display_list,
+                                 state='readonly', width=45)
+            # 기존 선택 또는 첫 번째 항목
             if cam_name in self.current_calibration:
                 cal = self.current_calibration[cam_name]
                 for display, video in self.video_maps[cam_name].items():
@@ -1258,12 +1286,15 @@ class CalibrationDialog(tk.Toplevel):
                         break
             elif display_list:
                 combo.current(0)
-            combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+
+            combo.pack(fill=tk.X, padx=3, pady=(0, 4))
+            combo.bind('<<ComboboxSelected>>',
+                       lambda e, cn=cam_name: self._update_preview(cn))
             self.combos[cam_name] = combo
 
-        # 버튼
+        # 하단 버튼
         btn_frame = tk.Frame(self)
-        btn_frame.pack(pady=15)
+        btn_frame.pack(pady=10)
 
         tk.Button(btn_frame, text="확인", command=self._confirm,
                   width=12, height=2, bg='#4CAF50', fg='white'
@@ -1274,6 +1305,58 @@ class CalibrationDialog(tk.Toplevel):
         tk.Button(btn_frame, text="취소", command=self._cancel,
                   width=12, height=2, bg='#f44336', fg='white'
                   ).pack(side=tk.LEFT, padx=10)
+
+    # ── 프리뷰 ──
+
+    def _load_all_previews(self):
+        for cam_name in self.combos:
+            self._update_preview(cam_name)
+
+    def _update_preview(self, cam_name):
+        combo = self.combos[cam_name]
+        selected = combo.get()
+        label = self.preview_labels[cam_name]
+
+        if not selected or selected not in self.video_maps[cam_name]:
+            label.config(image='', text='선택 없음', fg='gray')
+            return
+
+        video = self.video_maps[cam_name][selected]
+
+        try:
+            cap = cv2.VideoCapture(video.filepath)
+            ret, frame = cap.read()
+            cap.release()
+
+            if not ret:
+                label.config(image='', text='프레임 읽기 실패', fg='red')
+                return
+
+            # 라벨 크기에 맞춰 스케일링
+            label.update_idletasks()
+            lw = label.winfo_width()
+            lh = label.winfo_height()
+            if lw < 50:
+                lw = 320
+            if lh < 50:
+                lh = 220
+
+            h, w = frame.shape[:2]
+            scale = min(lw / w, lh / h)
+            new_w = max(int(w * scale), 1)
+            new_h = max(int(h * scale), 1)
+
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
+
+            img = Image.fromarray(frame_resized)
+            photo = ImageTk.PhotoImage(img)
+            self.photo_images.append(photo)
+            label.config(image=photo, text='')
+        except Exception as e:
+            label.config(image='', text=f'오류: {e}', fg='red')
+
+    # ── 결과 ──
 
     def _confirm(self):
         self.result = {}
