@@ -842,7 +842,51 @@ class SetGridViewer(tk.Toplevel):
         # 기본 선택 하이라이트
         self.speed_buttons[33].config(bg='#2196F3')
 
-    # ── 프록시 생성 ──
+    # ── 프록시 생성 (GPU 가속 + 병렬) ──
+
+    _proxy_encoder = None  # 클래스 레벨 캐시: None=미감지, 'unavailable', (hwaccel, encoder)
+
+    @classmethod
+    def _detect_encoder(cls):
+        """최적 ffmpeg 인코더를 감지한다. GPU 우선, 소프트웨어 폴백."""
+        if cls._proxy_encoder is not None:
+            return
+
+        # (hwaccel_args, encoder_args) — GPU 빠른 순서대로 시도
+        candidates = [
+            # NVIDIA NVENC + CUDA 디코딩
+            (['-hwaccel', 'cuda'],
+             ['-c:v', 'h264_nvenc', '-preset', 'p1']),
+            # NVIDIA NVENC (소프트웨어 디코딩)
+            ([],
+             ['-c:v', 'h264_nvenc', '-preset', 'p1']),
+            # Intel Quick Sync
+            ([],
+             ['-c:v', 'h264_qsv', '-preset', 'veryfast']),
+            # AMD AMF
+            ([],
+             ['-c:v', 'h264_amf', '-quality', 'speed']),
+            # 소프트웨어 폴백
+            ([],
+             ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28']),
+        ]
+
+        for hwaccel, encoder in candidates:
+            try:
+                cmd = (['ffmpeg', '-f', 'lavfi', '-i',
+                        'color=c=black:s=64x64:d=0.1', '-frames:v', '1']
+                       + encoder + ['-f', 'null', '-'])
+                result = subprocess.run(cmd, capture_output=True, timeout=10)
+                if result.returncode == 0:
+                    cls._proxy_encoder = (hwaccel, encoder)
+                    return
+            except FileNotFoundError:
+                cls._proxy_encoder = 'unavailable'
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
+        cls._proxy_encoder = 'unavailable'
 
     def _get_proxy_path(self, video):
         """비디오에 대응하는 프록시 파일 경로를 반환한다."""
@@ -851,57 +895,67 @@ class SetGridViewer(tk.Toplevel):
         proxy_name = f"{video.folder}_{video.filename}"
         return os.path.join(self.proxy_dir, proxy_name)
 
-    def _ensure_proxy(self, video):
-        """프록시 파일이 없으면 생성하고, 경로를 반환한다."""
-        proxy_path = self._get_proxy_path(video)
-        if proxy_path is None:
-            return video.filepath
-
-        if os.path.exists(proxy_path):
-            return proxy_path
-
-        # ffmpeg로 저해상도 프록시 생성
-        try:
-            result = subprocess.run([
-                'ffmpeg', '-i', video.filepath,
-                '-vf', f'scale={self.PROXY_WIDTH}:-2',
-                '-c:v', 'libx264', '-preset', 'ultrafast',
-                '-crf', '28', '-an', '-y', proxy_path
-            ], capture_output=True, timeout=600)
-            if result.returncode == 0 and os.path.exists(proxy_path):
-                return proxy_path
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass
-
-        return video.filepath  # 프록시 실패 시 원본 사용
-
     def _generate_proxies_for_set(self, cam_dict):
-        """세트의 모든 카메라 프록시를 병렬 생성한다."""
+        """세트의 모든 카메라 프록시를 병렬 생성한다.
+        GPU 인코더를 자동 감지하고, 모든 카메라를 동시에 인코딩."""
         if not self.proxy_dir:
             return {}
 
+        # 인코더 감지 (최초 1회)
+        self._detect_encoder()
+        if self._proxy_encoder == 'unavailable':
+            return {cam: cam_dict[cam].filepath for cam in cam_dict}
+
+        hwaccel, encoder = self._proxy_encoder
+        w = self.PROXY_WIDTH
+
         cams = sorted(cam_dict.keys(), key=natural_sort_key)
-        # 생성 필요한 것만 필터
-        need_gen = []
         proxy_paths = {}
+        need_gen = []
+
         for cam in cams:
             video = cam_dict[cam]
             pp = self._get_proxy_path(video)
-            if pp and not os.path.exists(pp):
-                need_gen.append((cam, video))
-            proxy_paths[cam] = pp if pp else video.filepath
+            if pp and os.path.exists(pp):
+                proxy_paths[cam] = pp
+            elif pp:
+                need_gen.append((cam, video, pp))
+            else:
+                proxy_paths[cam] = video.filepath
 
         if not need_gen:
             return proxy_paths
 
-        # 진행 상태 표시
-        total = len(need_gen)
-        for i, (cam, video) in enumerate(need_gen):
+        encoder_name = encoder[1]  # e.g. 'h264_nvenc'
+        self.set_label.config(
+            text=f"프록시 생성 중... ({len(need_gen)}개 병렬, {encoder_name})")
+        self.update()
+
+        # 모든 카메라 ffmpeg를 동시 실행
+        procs = {}
+        for cam, video, pp in need_gen:
+            cmd = (['ffmpeg'] + hwaccel +
+                   ['-i', video.filepath, '-vf', f'scale={w}:-2'] +
+                   encoder + ['-an', '-y', pp])
+            try:
+                proc = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                procs[cam] = (proc, pp, video)
+            except Exception:
+                proxy_paths[cam] = video.filepath
+
+        # 완료 대기
+        done = 0
+        for cam, (proc, pp, video) in procs.items():
+            proc.wait()
+            done += 1
             self.set_label.config(
-                text=f"프록시 생성 중... ({i + 1}/{total}) {cam}")
+                text=f"프록시 생성 중... ({done}/{len(procs)} 완료)")
             self.update()
-            pp = self._ensure_proxy(video)
-            proxy_paths[cam] = pp
+            if proc.returncode == 0 and os.path.exists(pp):
+                proxy_paths[cam] = pp
+            else:
+                proxy_paths[cam] = video.filepath
 
         return proxy_paths
 
