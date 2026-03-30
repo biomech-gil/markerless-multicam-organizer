@@ -282,7 +282,7 @@ class SetMatcher:
         subfolders = sorted([
             d for d in os.listdir(root_folder)
             if os.path.isdir(os.path.join(root_folder, d))
-            and d != FileHistoryManager.HISTORY_DIR
+            and d not in (FileHistoryManager.HISTORY_DIR, 'OrganizedVideos')
         ], key=natural_sort_key)
 
         all_files = []
