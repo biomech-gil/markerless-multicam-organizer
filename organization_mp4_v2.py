@@ -2177,15 +2177,20 @@ class VideoTrimmerDialog(tk.Toplevel):
                     '-t', f'{duration:.6f}',
                     '-c:v', 'libx264', '-crf', '17',
                     '-preset', 'fast',
+                    '-pix_fmt', 'yuv420p',
                     '-r', orig_rate,
                     '-video_track_timescale', str(best_timescale),
                     '-an',
                     '-y', seg_path
                 ], capture_output=True, timeout=1200)
-                if r.returncode != 0 or not os.path.exists(seg_path):
+
+                # 인코딩 검증: 실패 또는 비정상 파일 감지
+                seg_ok = (r.returncode == 0 and os.path.exists(seg_path)
+                          and os.path.getsize(seg_path) > 1000)
+                if not seg_ok:
+                    err = r.stderr.decode(errors='replace')[-400:] if r.stderr else "파일 크기 0"
                     messagebox.showerror("오류",
-                        f"구간 {i + 1} 인코딩 실패:\n"
-                        f"{r.stderr.decode(errors='replace')[:400]}")
+                        f"구간 {i + 1} 인코딩 실패:\n{err}")
                     return
                 seg_files.append(seg_path)
 
@@ -2209,16 +2214,22 @@ class VideoTrimmerDialog(tk.Toplevel):
                 return
 
             # 3단계: 검증
+            self.set_label_text("검증 중...")
             final_rate = self._get_ffprobe_rate(output)
+            out_size = os.path.getsize(output) if os.path.exists(output) else 0
+            orig_size = os.path.getsize(self.filepath) if self.filepath else 0
             total_f = sum(e - s for s, e in self.segments)
             match = "일치" if (self.r_frame_rate and final_rate == self.r_frame_rate) else "확인 필요"
+
+            size_mb = out_size / (1024 * 1024)
+            self.set_label_text(os.path.basename(self.filepath))
 
             messagebox.showinfo("내보내기 완료",
                 f"{output}\n\n"
                 f"{len(self.segments)}개 구간, {total_f}프레임\n"
                 f"원본 fps: {self.r_frame_rate or 'N/A'}\n"
                 f"출력 fps: {final_rate or 'N/A'}\n"
-                f"방식: CRF 0 무손실 (프레임 정확)\n"
+                f"파일 크기: {size_mb:.1f} MB\n"
                 f"상태: {match}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
