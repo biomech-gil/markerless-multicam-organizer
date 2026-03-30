@@ -2321,6 +2321,8 @@ class VideoOrganizerGUI:
                   width=15, height=2, bg='#4CAF50', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="영상 편집", command=self.open_trimmer,
                   width=10, height=2, bg='#607D8B', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Button(control_frame, text="카메라 제외", command=self.exclude_cameras,
+                  width=10, height=2, bg='#795548', fg='white').pack(side=tk.LEFT, padx=3)
 
         # 진행 상황
         self.progress_var = tk.StringVar(value="준비 중...")
@@ -2880,6 +2882,127 @@ class VideoOrganizerGUI:
 
     def open_trimmer(self):
         VideoTrimmerDialog(self.root)
+
+    def exclude_cameras(self):
+        """렌즈 캘리브레이션 실패 등으로 특정 카메라를 제외한다.
+        OrganizedVideos 폴더에서 해당 카메라 하위 폴더를 일괄 삭제."""
+        folder = self.organizer.root_folder
+        if not folder or not os.path.isdir(folder):
+            messagebox.showwarning("경고", "먼저 폴더를 선택하세요.")
+            return
+
+        # 사용 가능한 카메라 목록 수집 (원본 폴더 + OrganizedVideos)
+        all_cams = set()
+        for d in os.listdir(folder):
+            dp = os.path.join(folder, d)
+            if os.path.isdir(dp) and d not in (
+                    FileHistoryManager.HISTORY_DIR, 'OrganizedVideos'):
+                all_cams.add(d)
+
+        org_path = os.path.join(folder, 'OrganizedVideos')
+        org_cams = set()
+        if os.path.isdir(org_path):
+            for set_dir in os.listdir(org_path):
+                set_path = os.path.join(org_path, set_dir)
+                if os.path.isdir(set_path):
+                    for cam_dir in os.listdir(set_path):
+                        if os.path.isdir(os.path.join(set_path, cam_dir)):
+                            org_cams.add(cam_dir)
+
+        all_cams = sorted(all_cams | org_cams, key=natural_sort_key)
+        if not all_cams:
+            messagebox.showinfo("정보", "카메라 폴더가 없습니다.")
+            return
+
+        # 다이얼로그: 체크박스로 유지/제외 선택
+        dialog = tk.Toplevel(self.root)
+        dialog.title("카메라 제외 — 렌즈 캘리브레이션 통과 카메라만 유지")
+        dialog.geometry("500x400")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        tk.Label(dialog,
+                 text="유지할 카메라를 체크하세요.\n"
+                      "체크 해제된 카메라는 OrganizedVideos에서 제거됩니다.",
+                 font=('Arial', 10), justify=tk.LEFT).pack(pady=10, padx=10)
+
+        # 버튼을 먼저 pack (항상 보임)
+        btn_frame = tk.Frame(dialog)
+        btn_frame.pack(side=tk.BOTTOM, pady=10)
+
+        result = {'confirmed': False}
+
+        def on_confirm():
+            result['confirmed'] = True
+            dialog.destroy()
+
+        tk.Button(btn_frame, text="적용", command=on_confirm,
+                  bg='#f44336', fg='white', width=12, height=2
+                  ).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="취소", command=dialog.destroy,
+                  bg='#555', fg='white', width=12, height=2
+                  ).pack(side=tk.LEFT, padx=10)
+
+        # 체크박스 목록
+        check_frame = tk.Frame(dialog)
+        check_frame.pack(fill=tk.BOTH, expand=True, padx=10)
+
+        cam_vars = {}
+        for cam in all_cams:
+            var = tk.BooleanVar(value=True)
+            cb = tk.Checkbutton(check_frame, text=cam, variable=var,
+                                font=('Arial', 11), anchor='w')
+            cb.pack(fill=tk.X, padx=5, pady=1)
+            cam_vars[cam] = var
+
+        dialog.wait_window(dialog)
+
+        if not result['confirmed']:
+            return
+
+        # 제외할 카메라 목록
+        exclude = [cam for cam, var in cam_vars.items() if not var.get()]
+        if not exclude:
+            messagebox.showinfo("정보", "제외할 카메라가 없습니다.")
+            return
+
+        resp = messagebox.askyesno("최종 확인",
+            f"다음 카메라를 OrganizedVideos에서 제거합니다:\n\n"
+            f"{', '.join(exclude)}\n\n"
+            f"모든 세트의 해당 카메라 폴더가 삭제됩니다.\n진행하시겠습니까?")
+        if not resp:
+            return
+
+        # OrganizedVideos 내 해당 카메라 폴더 삭제
+        removed = 0
+        errors = []
+        if os.path.isdir(org_path):
+            for set_dir in os.listdir(org_path):
+                set_path = os.path.join(org_path, set_dir)
+                if not os.path.isdir(set_path):
+                    continue
+                for cam in exclude:
+                    cam_path = os.path.join(set_path, cam)
+                    if os.path.isdir(cam_path):
+                        try:
+                            shutil.rmtree(cam_path)
+                            removed += 1
+                        except Exception as e:
+                            errors.append(f"{set_dir}/{cam}: {e}")
+
+        self.result_text.delete(1.0, tk.END)
+        self.result_text.insert(tk.END, "카메라 제외 완료\n\n", 'header')
+        self.result_text.insert(tk.END,
+            f"제외 카메라: {', '.join(exclude)}\n", 'warning')
+        self.result_text.insert(tk.END,
+            f"삭제된 폴더: {removed}개\n", 'info')
+        if errors:
+            self.result_text.insert(tk.END, f"\n오류:\n", 'error')
+            for err in errors:
+                self.result_text.insert(tk.END, f"  {err}\n", 'error')
+
+        self.progress_var.set(
+            f"카메라 제외 완료: {', '.join(exclude)} ({removed}개 폴더 삭제)")
 
     def run(self):
         self.root.mainloop()
