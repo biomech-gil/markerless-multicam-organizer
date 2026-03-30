@@ -747,7 +747,6 @@ class SetGridViewer(tk.Toplevel):
         self._cam_next_frame = {}     # {cam: 다음 예상 프레임} seek 생략용
 
         self._setup_ui()
-        self._load_set(0)
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.bind('<Left>', lambda e: self._prev_frame())
@@ -755,6 +754,10 @@ class SetGridViewer(tk.Toplevel):
         self.bind('<space>', lambda e: self._toggle_play())
         self.bind('<Up>', lambda e: self._prev_set())
         self.bind('<Down>', lambda e: self._next_set())
+
+        # 창을 먼저 렌더링한 후 첫 세트 로드
+        self.update()
+        self.after(50, lambda: self._load_set(0))
 
     def _setup_ui(self):
         # 상단 컨트롤
@@ -866,7 +869,8 @@ class SetGridViewer(tk.Toplevel):
         set_name, cam_dict = self.matched_sets[idx]
 
         self.set_label.config(
-            text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)})")
+            text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)})  로딩 중...")
+        self.update()
 
         # 캡처 열기
         self.cam_names = sorted(cam_dict.keys(), key=natural_sort_key)
@@ -911,7 +915,7 @@ class SetGridViewer(tk.Toplevel):
             name_lbl.pack(fill=tk.X)
             self.grid_name_labels[cam] = name_lbl
 
-            img_lbl = tk.Label(cell, bg='black')
+            img_lbl = tk.Label(cell, bg='black', text='로딩 중...', fg='gray')
             img_lbl.pack(fill=tk.BOTH, expand=True)
             self.grid_labels[cam] = img_lbl
 
@@ -920,7 +924,41 @@ class SetGridViewer(tk.Toplevel):
         for r in range(rows * 2):
             self.grid_frame.rowconfigure(r, weight=1)
 
-        self._show_frame(0)
+        # 그리드를 먼저 보여준 뒤 첫 프레임 비동기 디코딩
+        self.update()
+        self._load_first_frame_async()
+
+    def _load_first_frame_async(self):
+        """첫 프레임을 백그라운드에서 디코딩하여 UI를 블로킹하지 않는다."""
+        def do_decode():
+            data = self._decode_all_parallel(0)
+            # 메인 스레드에서 UI 갱신
+            self.after(0, lambda: self._apply_frame_data(data, 0))
+
+        threading.Thread(target=do_decode, daemon=True).start()
+
+    def _apply_frame_data(self, frame_data, frame_no):
+        """디코딩된 프레임 데이터를 UI에 반영한다."""
+        self.current_frame = frame_no
+        self.photo_images.clear()
+        for cam in self.cam_names:
+            label = self.grid_labels.get(cam)
+            if label is None:
+                continue
+            data = frame_data.get(cam)
+            if data is not None:
+                img = Image.fromarray(data)
+                photo = ImageTk.PhotoImage(img)
+                self.photo_images.append(photo)
+                label.config(image=photo, text='')
+            else:
+                label.config(image='', text='END', fg='gray')
+
+        self.frame_label.config(text=f"Frame: {frame_no}/{self.max_frames}")
+        self.frame_slider.set(frame_no)
+        set_name = self.matched_sets[self.current_set_idx][0]
+        self.set_label.config(
+            text=f"{set_name}  ({self.current_set_idx + 1}/{len(self.matched_sets)})")
 
     # ── 병렬 디코딩 엔진 ──
     #
@@ -1059,23 +1097,7 @@ class SetGridViewer(tk.Toplevel):
         if frame_data is None:
             frame_data = self._decode_all_parallel(self.current_frame)
 
-        # UI 갱신 (메인 스레드)
-        self.photo_images.clear()
-        for cam in self.cam_names:
-            label = self.grid_labels.get(cam)
-            if label is None:
-                continue
-            data = frame_data.get(cam)
-            if data is not None:
-                img = Image.fromarray(data)
-                photo = ImageTk.PhotoImage(img)
-                self.photo_images.append(photo)
-                label.config(image=photo)
-            else:
-                label.config(image='', text='END', fg='gray')
-
-        self.frame_label.config(text=f"Frame: {self.current_frame}/{self.max_frames}")
-        self.frame_slider.set(self.current_frame)
+        self._apply_frame_data(frame_data, self.current_frame)
 
     def _on_slider(self, val):
         frame_no = int(float(val))
