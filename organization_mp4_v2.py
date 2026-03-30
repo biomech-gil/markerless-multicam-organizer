@@ -2025,6 +2025,20 @@ class VideoTrimmerDialog(tk.Toplevel):
 
     # ── 내보내기 ──
 
+    def _get_codec_name(self):
+        """ffprobe로 비디오 코덱명을 반환 (h264, hevc 등)."""
+        try:
+            r = subprocess.run([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=codec_name',
+                '-of', 'csv=p=0', self.filepath
+            ], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return r.stdout.strip().split('\n')[0]
+        except Exception:
+            pass
+        return None
+
     def _get_ffprobe_rate(self, filepath):
         """ffprobe로 r_frame_rate 문자열 (예: '180000/1001')을 반환."""
         try:
@@ -2035,6 +2049,24 @@ class VideoTrimmerDialog(tk.Toplevel):
             ], capture_output=True, text=True, timeout=10)
             if r.returncode == 0:
                 return r.stdout.strip().split('\n')[0]
+        except Exception:
+            pass
+        return None
+
+    def _get_ffprobe_timescale(self, filepath):
+        """ffprobe로 비디오 트랙의 실제 timescale (time_base의 역수)을 반환."""
+        try:
+            r = subprocess.run([
+                'ffprobe', '-v', 'error', '-select_streams', 'v:0',
+                '-show_entries', 'stream=time_base',
+                '-of', 'csv=p=0', filepath
+            ], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                tb = r.stdout.strip().split('\n')[0]  # 예: "1/180000"
+                if '/' in tb:
+                    num, den = map(int, tb.split('/'))
+                    if num == 1:
+                        return den  # 180000
         except Exception:
             pass
         return None
@@ -2053,13 +2085,47 @@ class VideoTrimmerDialog(tk.Toplevel):
 
         orig_rate = self.r_frame_rate  # 예: "180000/1001"
 
+        # 원본의 실제 timescale 감지 (r_frame_rate 분자와 다를 수 있음)
+        orig_timescale = self._get_ffprobe_timescale(self.filepath)
+
+        # ── 최적 timescale 결정 ──
+        # 핵심: MP4 stts box의 sample_delta는 정수여야 한다.
+        # timescale / fps = sample_delta 이므로,
+        # fps=180000/1001 일 때 timescale=180000 → sample_delta=1001 (정수, 완벽!)
+        # fps=180000/1001 일 때 timescale=90000  → sample_delta=500.5 (비정수, VFR 발생!)
+        #
+        # ffmpeg 기본 timescale(90000)이 fps와 맞지 않으면 sample_delta를
+        # 500과 501로 번갈아 기록하여 평균적으로 맞추려 하지만, 이것이
+        # 컨테이너 수준에서 VFR로 인식되고 Windows 파일 속성에서
+        # 잘못된 fps(예: 188.16fps)를 표시하는 원인이 된다.
+        if orig_rate and '/' in orig_rate:
+            fps_num, fps_den = map(int, orig_rate.split('/'))
+            # fps_num 자체를 timescale로 쓰면 sample_delta = fps_den (정수)
+            best_timescale = fps_num  # 예: 180000
+        elif orig_timescale:
+            best_timescale = orig_timescale
+        else:
+            best_timescale = 90000
+
+        # 코덱 감지 → raw stream 추출 방식 결정
+        codec = self._get_codec_name()
+        if codec in ('hevc', 'h265'):
+            raw_bsf, raw_fmt, raw_ext = 'hevc_mp4toannexb', 'hevc', '.h265'
+        else:
+            raw_bsf, raw_fmt, raw_ext = 'h264_mp4toannexb', 'h264', '.h264'
+
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
-            # 1단계: 구간별 raw 스트림 추출
+            # ────────────────────────────────────────────
+            # 1단계: 구간별 raw elementary stream 추출
+            # ────────────────────────────────────────────
+            # MP4 컨테이너의 timestamp를 완전히 버리고,
+            # raw bitstream만 추출하여 이후 깨끗한 CFR 타이밍을 부여한다.
             seg_files = []
+            use_raw = True
             for i, (s, e) in enumerate(self.segments):
-                seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+                seg_path = os.path.join(temp_dir, f"seg_{i:04d}{raw_ext}")
                 ss = s / self.fps if self.fps > 0 else 0
                 duration = (e - s) / self.fps if self.fps > 0 else 0
                 r = subprocess.run([
@@ -2067,51 +2133,84 @@ class VideoTrimmerDialog(tk.Toplevel):
                     '-ss', f'{ss:.6f}',
                     '-i', self.filepath,
                     '-t', f'{duration:.6f}',
-                    '-c', 'copy', '-y', seg_path
+                    '-c:v', 'copy', '-an',
+                    '-bsf:v', raw_bsf,
+                    '-f', raw_fmt,
+                    '-y', seg_path
                 ], capture_output=True)
                 if r.returncode != 0 or not os.path.exists(seg_path):
-                    messagebox.showerror("오류",
-                        f"구간 {i + 1} 추출 실패:\n"
-                        f"{r.stderr.decode(errors='replace')[:300]}")
-                    return
+                    # raw 추출 실패 → MP4 fallback
+                    use_raw = False
+                    seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
+                    r = subprocess.run([
+                        'ffmpeg',
+                        '-ss', f'{ss:.6f}',
+                        '-i', self.filepath,
+                        '-t', f'{duration:.6f}',
+                        '-c', 'copy', '-y', seg_path
+                    ], capture_output=True)
+                    if r.returncode != 0 or not os.path.exists(seg_path):
+                        messagebox.showerror("오류",
+                            f"구간 {i + 1} 추출 실패:\n"
+                            f"{r.stderr.decode(errors='replace')[:300]}")
+                        return
                 seg_files.append(seg_path)
 
-            # 2단계: 병합 (임시)
-            list_path = os.path.join(temp_dir, "list.txt")
-            with open(list_path, 'w', encoding='utf-8') as f:
-                for p in seg_files:
-                    f.write(f"file '{p.replace(os.sep, '/')}'\n")
+            # ────────────────────────────────────────────
+            # 2단계: 바이너리 결합 + MP4 리먹싱
+            # ────────────────────────────────────────────
+            if use_raw:
+                # raw elementary stream → 바이너리 이어붙이기
+                # (타임스탬프 없는 순수 비트스트림이므로 단순 결합 가능)
+                concat_raw = os.path.join(temp_dir, f"concat{raw_ext}")
+                with open(concat_raw, 'wb') as out_f:
+                    for seg in seg_files:
+                        with open(seg, 'rb') as in_f:
+                            shutil.copyfileobj(in_f, out_f)
 
-            concat_path = os.path.join(temp_dir, "concat_raw.mp4")
-            r = subprocess.run([
-                'ffmpeg', '-f', 'concat', '-safe', '0',
-                '-i', list_path, '-c', 'copy', '-y', concat_path
-            ], capture_output=True)
-            if r.returncode != 0:
-                messagebox.showerror("오류",
-                    f"병합 실패:\n{r.stderr.decode(errors='replace')[:300]}")
-                return
-
-            # 3단계: 원본 fps를 강제 주입하여 최종 컨테이너 생성
-            # -r 을 입력 옵션으로 → 컨테이너 타이밍을 원본 fps로 재작성
-            if orig_rate:
+                # 3단계: 깨끗한 CFR 타이밍으로 MP4 컨테이너 생성
+                # -f raw_fmt -r RATE: raw demuxer에 fps를 알려줌
+                # → ffmpeg가 완전히 새로운 균일 CFR 타이밍 생성
+                # -video_track_timescale: sample_delta가 정수가 되는 값
+                rate_arg = orig_rate or f'{self.fps:.6f}'
                 remux_cmd = [
                     'ffmpeg',
-                    '-r', orig_rate,
-                    '-i', concat_path,
-                    '-c', 'copy',
-                    '-video_track_timescale', str(self.timescale or 90000),
+                    '-f', raw_fmt,
+                    '-r', rate_arg,
+                    '-i', concat_raw,
+                    '-c:v', 'copy',
+                    '-video_track_timescale', str(best_timescale),
+                    '-movflags', '+faststart',
                     '-y', output
                 ]
                 r = subprocess.run(remux_cmd, capture_output=True)
                 if r.returncode != 0:
-                    # 리먹싱 실패 시 그냥 복사
-                    shutil.copy2(concat_path, output)
+                    messagebox.showerror("오류",
+                        f"MP4 생성 실패:\n"
+                        f"{r.stderr.decode(errors='replace')[:300]}")
+                    return
             else:
-                shutil.copy2(concat_path, output)
+                # Fallback: MP4 세그먼트 → concat demuxer
+                list_path = os.path.join(temp_dir, "list.txt")
+                with open(list_path, 'w', encoding='utf-8') as f:
+                    for p in seg_files:
+                        f.write(f"file '{p.replace(os.sep, '/')}'\n")
+                r = subprocess.run([
+                    'ffmpeg', '-f', 'concat', '-safe', '0',
+                    '-i', list_path, '-c', 'copy',
+                    '-video_track_timescale', str(best_timescale),
+                    '-y', output
+                ], capture_output=True)
+                if r.returncode != 0:
+                    messagebox.showerror("오류",
+                        f"병합 실패:\n{r.stderr.decode(errors='replace')[:300]}")
+                    return
 
+            # ────────────────────────────────────────────
             # 4단계: 최종 검증
+            # ────────────────────────────────────────────
             final_rate = self._get_ffprobe_rate(output)
+            final_timescale = self._get_ffprobe_timescale(output)
             total_f = sum(e - s for s, e in self.segments)
 
             if orig_rate and final_rate == orig_rate:
@@ -2125,6 +2224,7 @@ class VideoTrimmerDialog(tk.Toplevel):
                 f"{output}\n\n"
                 f"{len(self.segments)}개 구간, {total_f}프레임\n"
                 f"r_frame_rate: {final_rate or 'N/A'}\n"
+                f"timescale: {final_timescale or 'N/A'}\n"
                 f"{status}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
