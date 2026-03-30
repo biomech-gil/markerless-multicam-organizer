@@ -776,7 +776,7 @@ class SetGridViewer(tk.Toplevel):
         # 세트 번호 직접 이동
         self.set_spin_var = tk.IntVar(value=1)
         self.set_spin = tk.Spinbox(
-            top, from_=1, to=max(len(matched_sets), 1), width=5,
+            top, from_=1, to=max(len(self.matched_sets), 1), width=5,
             textvariable=self.set_spin_var, bg='#444', fg='white',
             font=('Arial', 12, 'bold'))
         self.set_spin.pack(side=tk.LEFT, padx=2, pady=5)
