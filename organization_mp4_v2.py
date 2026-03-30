@@ -332,68 +332,80 @@ class SetMatcher:
             else:
                 working_folders[cam] = list(self.cam_folders[cam])
 
-        # 기준 카메라 = 파일 수가 가장 적은 카메라
-        ref_cam = min(cam_names, key=lambda c: len(working_folders[c]))
-        ref_videos = list(working_folders[ref_cam])
+        # 모든 카메라의 파일 수가 동일한지 확인
+        counts = [len(working_folders[c]) for c in cam_names]
+        all_same_count = len(set(counts)) == 1 and counts[0] > 0
 
-        # 캘리브레이션이 있으면 C0002부터 시작
-        pointers = {cam: 0 for cam in cam_names}
-        set_index = 2 if self.calibration_videos else 1
+        if all_same_count:
+            # ── 파일 수 동일: CNNNN 순서대로 1:1 매핑 (duration 무시) ──
+            n_files = counts[0]
+            set_index = 2 if self.calibration_videos else 1
+            for i in range(n_files):
+                current_set = {}
+                for cam in cam_names:
+                    current_set[cam] = working_folders[cam][i]
+                set_name = f"C{set_index:04d}"
+                self.matched_sets.append((set_name, current_set))
+                set_index += 1
+        else:
+            # ── 파일 수 다름: duration 기반 매칭 ──
+            ref_cam = min(cam_names, key=lambda c: len(working_folders[c]))
+            ref_videos = list(working_folders[ref_cam])
 
-        for ref_idx, ref_video in enumerate(ref_videos):
-            pointers[ref_cam] = ref_idx
-            ref_dur = ref_video.duration
+            pointers = {cam: 0 for cam in cam_names}
+            set_index = 2 if self.calibration_videos else 1
 
-            current_set = {ref_cam: ref_video}
-            all_match = True
+            for ref_idx, ref_video in enumerate(ref_videos):
+                pointers[ref_cam] = ref_idx
+                ref_dur = ref_video.duration
+
+                current_set = {ref_cam: ref_video}
+                all_match = True
+
+                for cam in cam_names:
+                    if cam == ref_cam:
+                        continue
+
+                    cam_list = working_folders[cam]
+                    ptr = pointers[cam]
+                    found = False
+
+                    search_range = min(ptr + 4, len(cam_list))
+                    best_match_idx = -1
+                    best_diff = float('inf')
+
+                    for search_idx in range(ptr, search_range):
+                        diff = abs(cam_list[search_idx].duration - ref_dur)
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_match_idx = search_idx
+
+                    if best_match_idx >= 0 and best_diff <= self.duration_tolerance:
+                        for skip_idx in range(ptr, best_match_idx):
+                            self.unmatched[cam].append(cam_list[skip_idx])
+                        current_set[cam] = cam_list[best_match_idx]
+                        pointers[cam] = best_match_idx + 1
+                        found = True
+
+                    if not found:
+                        all_match = False
+
+                if all_match and len(current_set) == len(cam_names):
+                    set_name = f"C{set_index:04d}"
+                    self.matched_sets.append((set_name, current_set))
+                    set_index += 1
+                elif len(current_set) > 1:
+                    set_name = f"C{set_index:04d}"
+                    self.matched_sets.append((set_name, current_set))
+                    set_index += 1
+                else:
+                    self.unmatched[ref_cam].append(ref_video)
 
             for cam in cam_names:
                 if cam == ref_cam:
                     continue
-
-                cam_list = working_folders[cam]
-                ptr = pointers[cam]
-                found = False
-
-                # 현재 포인터 위치부터 최대 3개까지 탐색
-                search_range = min(ptr + 4, len(cam_list))
-                best_match_idx = -1
-                best_diff = float('inf')
-
-                for search_idx in range(ptr, search_range):
-                    diff = abs(cam_list[search_idx].duration - ref_dur)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_match_idx = search_idx
-
-                if best_match_idx >= 0 and best_diff <= self.duration_tolerance:
-                    # 건너뛴 파일들은 미매칭
-                    for skip_idx in range(ptr, best_match_idx):
-                        self.unmatched[cam].append(cam_list[skip_idx])
-                    current_set[cam] = cam_list[best_match_idx]
-                    pointers[cam] = best_match_idx + 1
-                    found = True
-
-                if not found:
-                    all_match = False
-
-            if all_match and len(current_set) == len(cam_names):
-                set_name = f"C{set_index:04d}"
-                self.matched_sets.append((set_name, current_set))
-                set_index += 1
-            elif len(current_set) > 1:
-                set_name = f"C{set_index:04d}"
-                self.matched_sets.append((set_name, current_set))
-                set_index += 1
-            else:
-                self.unmatched[ref_cam].append(ref_video)
-
-        # 각 카메라에서 남은 파일 미매칭 처리
-        for cam in cam_names:
-            if cam == ref_cam:
-                continue
-            for remaining_idx in range(pointers[cam], len(working_folders[cam])):
-                self.unmatched[cam].append(working_folders[cam][remaining_idx])
+                for remaining_idx in range(pointers[cam], len(working_folders[cam])):
+                    self.unmatched[cam].append(working_folders[cam][remaining_idx])
 
         # 캘리브레이션 세트를 C0001로 맨 앞에 삽입
         if self.calibration_videos:
@@ -1003,15 +1015,23 @@ class SetGridViewer(tk.Toplevel):
                     if v.filepath == video.filepath:
                         current_display = display
 
-                combo = ttk.Combobox(cell, values=display_list,
-                                     state='readonly', width=40,
+                combo_row = tk.Frame(cell, bg='black')
+                combo_row.pack(fill=tk.X, padx=2, pady=(0, 2))
+
+                combo = ttk.Combobox(combo_row, values=display_list,
+                                     state='readonly', width=35,
                                      font=('Arial', 8))
                 if current_display:
                     combo.set(current_display)
-                combo.pack(fill=tk.X, padx=2, pady=(0, 2))
+                combo.pack(side=tk.LEFT, fill=tk.X, expand=True)
                 combo.bind('<<ComboboxSelected>>',
                            lambda e, c=cam: self._on_file_change(c))
                 self.file_combos[cam] = combo
+
+                tk.Button(combo_row, text="...", width=3,
+                          bg='#555', fg='white', font=('Arial', 8),
+                          command=lambda c=cam: self._browse_file(c)
+                          ).pack(side=tk.LEFT, padx=1)
 
         for c in range(cols):
             self.grid_frame.columnconfigure(c, weight=1)
@@ -1322,6 +1342,52 @@ class SetGridViewer(tk.Toplevel):
         self.apply_btn.config(state=tk.NORMAL)
 
         # 현재 프레임 새로 디코딩
+        self._cam_next_frame[cam] = -1
+        self._show_frame(self.current_frame)
+
+    def _browse_file(self, cam):
+        """파일 탐색기로 임의 mp4 파일을 선택하여 해당 카메라에 할당한다."""
+        filepath = filedialog.askopenfilename(
+            title=f"{cam} - 영상 파일 선택",
+            filetypes=[("MP4 파일", "*.mp4"), ("모든 파일", "*.*")])
+        if not filepath:
+            return
+
+        new_video = VideoInfo(filepath)
+        if new_video.error:
+            messagebox.showerror("오류", f"파일을 열 수 없습니다:\n{new_video.error}")
+            return
+
+        self._wait_for_pending_decode()
+
+        # 캡처 교체
+        old_cap = self.captures.get(cam)
+        if old_cap:
+            old_cap.release()
+        cap = cv2.VideoCapture(new_video.filepath)
+        self.captures[cam] = cap
+
+        self.grid_name_labels[cam].config(
+            text=f"{cam}: {new_video.filename} ({new_video.duration:.2f}s)")
+
+        fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if fc - 1 > self.max_frames:
+            self.max_frames = fc - 1
+            self.frame_slider.config(to=self.max_frames)
+
+        # Combobox에 추가 (없는 파일일 수 있으므로)
+        display = f"{new_video.filename}  ({new_video.duration:.2f}s)"
+        if cam in self.file_maps:
+            self.file_maps[cam][display] = new_video
+            combo = self.file_combos.get(cam)
+            if combo:
+                vals = list(combo['values']) + [display]
+                combo['values'] = vals
+                combo.set(display)
+
+        self._set_modified = True
+        self.apply_btn.config(state=tk.NORMAL)
+
         self._cam_next_frame[cam] = -1
         self._show_frame(self.current_frame)
 
@@ -1680,7 +1746,7 @@ class VideoOrganizerGUI:
         tolerance_frame.pack(fill=tk.X, padx=10)
 
         tk.Label(tolerance_frame, text="영상 길이 허용 오차 (초):").pack(side=tk.LEFT, padx=5)
-        self.duration_var = tk.DoubleVar(value=0.5)
+        self.duration_var = tk.DoubleVar(value=999.0)
         tk.Spinbox(tolerance_frame, from_=0.1, to=5.0, increment=0.1,
                    textvariable=self.duration_var, width=10).pack(side=tk.LEFT, padx=5)
 
