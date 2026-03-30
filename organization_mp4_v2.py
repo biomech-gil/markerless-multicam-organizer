@@ -2207,25 +2207,43 @@ class VideoTrimmerDialog(tk.Toplevel):
                     return
 
             # ────────────────────────────────────────────
-            # 4단계: 최종 검증
+            # 4단계: fps 검증 → 불일치 시 무손실 재인코딩 강제 보정
             # ────────────────────────────────────────────
             final_rate = self._get_ffprobe_rate(output)
-            final_timescale = self._get_ffprobe_timescale(output)
-            total_f = sum(e - s for s, e in self.segments)
+            method = "스트림 복사"
 
-            if orig_rate and final_rate == orig_rate:
-                status = "원본과 정확히 일치"
-            elif orig_rate and final_rate:
-                status = f"불일치! 원본={orig_rate}, 출력={final_rate}"
-            else:
-                status = "검증 생략 (ffprobe 없음)"
+            if orig_rate and final_rate and final_rate != orig_rate:
+                # fps 불일치! → CRF 0 무손실 재인코딩으로 강제 보정
+                fixed = output + ".fixing.mp4"
+                rate_arg = orig_rate
+                r = subprocess.run([
+                    'ffmpeg', '-i', output,
+                    '-c:v', 'libx264', '-crf', '0',
+                    '-preset', 'ultrafast',
+                    '-r', rate_arg,
+                    '-video_track_timescale', str(best_timescale),
+                    '-an', '-y', fixed
+                ], capture_output=True)
+
+                if r.returncode == 0 and os.path.exists(fixed):
+                    os.replace(fixed, output)
+                    final_rate = self._get_ffprobe_rate(output)
+                    method = "무손실 재인코딩 (CRF 0)"
+                else:
+                    # libx264 실패 시 원본 그대로 유지
+                    if os.path.exists(fixed):
+                        os.remove(fixed)
+
+            total_f = sum(e - s for s, e in self.segments)
+            match = "일치" if (orig_rate and final_rate == orig_rate) else "확인 필요"
 
             messagebox.showinfo("내보내기 완료",
                 f"{output}\n\n"
                 f"{len(self.segments)}개 구간, {total_f}프레임\n"
-                f"r_frame_rate: {final_rate or 'N/A'}\n"
-                f"timescale: {final_timescale or 'N/A'}\n"
-                f"{status}")
+                f"원본 fps: {orig_rate or 'N/A'}\n"
+                f"출력 fps: {final_rate or 'N/A'}\n"
+                f"방식: {method}\n"
+                f"상태: {match}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
