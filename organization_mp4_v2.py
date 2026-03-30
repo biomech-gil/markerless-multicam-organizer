@@ -2123,6 +2123,16 @@ class VideoTrimmerDialog(tk.Toplevel):
         return None
 
     def _export(self):
+        """CRF 0 무손실 재인코딩으로 프레임 정확 커팅 + fps 완벽 보존.
+
+        왜 -c copy를 쓰지 않는가:
+        1) -c copy는 키프레임에서만 자를 수 있어 구간 시작이 몇 프레임 앞당겨짐
+        2) -c copy는 MP4 stts box에 비정수 sample_delta를 만들어 fps가 변함
+        CRF 0 재인코딩은 두 문제를 동시에 해결:
+        - 임의 프레임에서 정확히 자름 (키프레임 제약 없음)
+        - -r로 fps를 직접 지정하므로 원본과 100% 동일
+        - CRF 0 = 수학적 무손실 (화질 동일)
+        """
         if not self.filepath or not self.segments:
             messagebox.showwarning("경고", "파일과 유지 구간을 먼저 지정하세요.")
             return
@@ -2134,166 +2144,74 @@ class VideoTrimmerDialog(tk.Toplevel):
         if not output:
             return
 
-        orig_rate = self.r_frame_rate  # 예: "180000/1001"
+        orig_rate = self.r_frame_rate or f'{self.fps:.6f}'
 
-        # 원본의 실제 timescale 감지 (r_frame_rate 분자와 다를 수 있음)
-        orig_timescale = self._get_ffprobe_timescale(self.filepath)
-
-        # ── 최적 timescale 결정 ──
-        # 핵심: MP4 stts box의 sample_delta는 정수여야 한다.
-        # timescale / fps = sample_delta 이므로,
-        # fps=180000/1001 일 때 timescale=180000 → sample_delta=1001 (정수, 완벽!)
-        # fps=180000/1001 일 때 timescale=90000  → sample_delta=500.5 (비정수, VFR 발생!)
-        #
-        # ffmpeg 기본 timescale(90000)이 fps와 맞지 않으면 sample_delta를
-        # 500과 501로 번갈아 기록하여 평균적으로 맞추려 하지만, 이것이
-        # 컨테이너 수준에서 VFR로 인식되고 Windows 파일 속성에서
-        # 잘못된 fps(예: 188.16fps)를 표시하는 원인이 된다.
-        if orig_rate and '/' in orig_rate:
-            fps_num, fps_den = map(int, orig_rate.split('/'))
-            # fps_num 자체를 timescale로 쓰면 sample_delta = fps_den (정수)
-            best_timescale = fps_num  # 예: 180000
-        elif orig_timescale:
-            best_timescale = orig_timescale
-        else:
-            best_timescale = 90000
-
-        # 코덱 감지 → raw stream 추출 방식 결정
-        codec = self._get_codec_name()
-        if codec in ('hevc', 'h265'):
-            raw_bsf, raw_fmt, raw_ext = 'hevc_mp4toannexb', 'hevc', '.h265'
-        else:
-            raw_bsf, raw_fmt, raw_ext = 'h264_mp4toannexb', 'h264', '.h264'
+        # 최적 timescale: fps 분자 사용 → sample_delta가 정수
+        best_timescale = 90000
+        if self.r_frame_rate and '/' in self.r_frame_rate:
+            fps_num, _ = map(int, self.r_frame_rate.split('/'))
+            best_timescale = fps_num
 
         import tempfile
         temp_dir = tempfile.mkdtemp()
         try:
-            # ────────────────────────────────────────────
-            # 1단계: 구간별 raw elementary stream 추출
-            # ────────────────────────────────────────────
-            # MP4 컨테이너의 timestamp를 완전히 버리고,
-            # raw bitstream만 추출하여 이후 깨끗한 CFR 타이밍을 부여한다.
+            # 1단계: 각 구간을 CRF 0 무손실 인코딩으로 프레임 정확 추출
+            #   -ss 를 -i 뒤에 배치 → 프레임 단위 정확한 시킹
+            #   -c:v libx264 -crf 0 → 무손실 재인코딩
+            #   -r 원본비율 → 정확한 CFR
             seg_files = []
-            use_raw = True
             for i, (s, e) in enumerate(self.segments):
-                seg_path = os.path.join(temp_dir, f"seg_{i:04d}{raw_ext}")
+                seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
                 ss = s / self.fps if self.fps > 0 else 0
                 duration = (e - s) / self.fps if self.fps > 0 else 0
                 r = subprocess.run([
                     'ffmpeg',
-                    '-ss', f'{ss:.6f}',
                     '-i', self.filepath,
+                    '-ss', f'{ss:.6f}',
                     '-t', f'{duration:.6f}',
-                    '-c:v', 'copy', '-an',
-                    '-bsf:v', raw_bsf,
-                    '-f', raw_fmt,
-                    '-y', seg_path
-                ], capture_output=True)
-                if r.returncode != 0 or not os.path.exists(seg_path):
-                    # raw 추출 실패 → MP4 fallback
-                    use_raw = False
-                    seg_path = os.path.join(temp_dir, f"seg_{i:04d}.mp4")
-                    r = subprocess.run([
-                        'ffmpeg',
-                        '-ss', f'{ss:.6f}',
-                        '-i', self.filepath,
-                        '-t', f'{duration:.6f}',
-                        '-c', 'copy', '-y', seg_path
-                    ], capture_output=True)
-                    if r.returncode != 0 or not os.path.exists(seg_path):
-                        messagebox.showerror("오류",
-                            f"구간 {i + 1} 추출 실패:\n"
-                            f"{r.stderr.decode(errors='replace')[:300]}")
-                        return
-                seg_files.append(seg_path)
-
-            # ────────────────────────────────────────────
-            # 2단계: 바이너리 결합 + MP4 리먹싱
-            # ────────────────────────────────────────────
-            if use_raw:
-                # raw elementary stream → 바이너리 이어붙이기
-                # (타임스탬프 없는 순수 비트스트림이므로 단순 결합 가능)
-                concat_raw = os.path.join(temp_dir, f"concat{raw_ext}")
-                with open(concat_raw, 'wb') as out_f:
-                    for seg in seg_files:
-                        with open(seg, 'rb') as in_f:
-                            shutil.copyfileobj(in_f, out_f)
-
-                # 3단계: 깨끗한 CFR 타이밍으로 MP4 컨테이너 생성
-                # -f raw_fmt -r RATE: raw demuxer에 fps를 알려줌
-                # → ffmpeg가 완전히 새로운 균일 CFR 타이밍 생성
-                # -video_track_timescale: sample_delta가 정수가 되는 값
-                rate_arg = orig_rate or f'{self.fps:.6f}'
-                remux_cmd = [
-                    'ffmpeg',
-                    '-f', raw_fmt,
-                    '-r', rate_arg,
-                    '-i', concat_raw,
-                    '-c:v', 'copy',
-                    '-video_track_timescale', str(best_timescale),
-                    '-movflags', '+faststart',
-                    '-y', output
-                ]
-                r = subprocess.run(remux_cmd, capture_output=True)
-                if r.returncode != 0:
-                    messagebox.showerror("오류",
-                        f"MP4 생성 실패:\n"
-                        f"{r.stderr.decode(errors='replace')[:300]}")
-                    return
-            else:
-                # Fallback: MP4 세그먼트 → concat demuxer
-                list_path = os.path.join(temp_dir, "list.txt")
-                with open(list_path, 'w', encoding='utf-8') as f:
-                    for p in seg_files:
-                        f.write(f"file '{p.replace(os.sep, '/')}'\n")
-                r = subprocess.run([
-                    'ffmpeg', '-f', 'concat', '-safe', '0',
-                    '-i', list_path, '-c', 'copy',
-                    '-video_track_timescale', str(best_timescale),
-                    '-y', output
-                ], capture_output=True)
-                if r.returncode != 0:
-                    messagebox.showerror("오류",
-                        f"병합 실패:\n{r.stderr.decode(errors='replace')[:300]}")
-                    return
-
-            # ────────────────────────────────────────────
-            # 4단계: fps 검증 → 불일치 시 무손실 재인코딩 강제 보정
-            # ────────────────────────────────────────────
-            final_rate = self._get_ffprobe_rate(output)
-            method = "스트림 복사"
-
-            if orig_rate and final_rate and final_rate != orig_rate:
-                # fps 불일치! → CRF 0 무손실 재인코딩으로 강제 보정
-                fixed = output + ".fixing.mp4"
-                rate_arg = orig_rate
-                r = subprocess.run([
-                    'ffmpeg', '-i', output,
                     '-c:v', 'libx264', '-crf', '0',
                     '-preset', 'ultrafast',
-                    '-r', rate_arg,
+                    '-r', orig_rate,
                     '-video_track_timescale', str(best_timescale),
-                    '-an', '-y', fixed
-                ], capture_output=True)
+                    '-an',
+                    '-y', seg_path
+                ], capture_output=True, timeout=600)
+                if r.returncode != 0 or not os.path.exists(seg_path):
+                    messagebox.showerror("오류",
+                        f"구간 {i + 1} 인코딩 실패:\n"
+                        f"{r.stderr.decode(errors='replace')[:400]}")
+                    return
+                seg_files.append(seg_path)
 
-                if r.returncode == 0 and os.path.exists(fixed):
-                    os.replace(fixed, output)
-                    final_rate = self._get_ffprobe_rate(output)
-                    method = "무손실 재인코딩 (CRF 0)"
-                else:
-                    # libx264 실패 시 원본 그대로 유지
-                    if os.path.exists(fixed):
-                        os.remove(fixed)
+            # 2단계: concat으로 병합 (-c copy: 이미 동일 코덱/fps이므로 안전)
+            list_path = os.path.join(temp_dir, "list.txt")
+            with open(list_path, 'w', encoding='utf-8') as f:
+                for p in seg_files:
+                    f.write(f"file '{p.replace(os.sep, '/')}'\n")
 
+            r = subprocess.run([
+                'ffmpeg', '-f', 'concat', '-safe', '0',
+                '-i', list_path, '-c', 'copy',
+                '-video_track_timescale', str(best_timescale),
+                '-movflags', '+faststart',
+                '-y', output
+            ], capture_output=True)
+            if r.returncode != 0:
+                messagebox.showerror("오류",
+                    f"병합 실패:\n{r.stderr.decode(errors='replace')[:400]}")
+                return
+
+            # 3단계: 검증
+            final_rate = self._get_ffprobe_rate(output)
             total_f = sum(e - s for s, e in self.segments)
-            match = "일치" if (orig_rate and final_rate == orig_rate) else "확인 필요"
+            match = "일치" if (self.r_frame_rate and final_rate == self.r_frame_rate) else "확인 필요"
 
             messagebox.showinfo("내보내기 완료",
                 f"{output}\n\n"
                 f"{len(self.segments)}개 구간, {total_f}프레임\n"
-                f"원본 fps: {orig_rate or 'N/A'}\n"
+                f"원본 fps: {self.r_frame_rate or 'N/A'}\n"
                 f"출력 fps: {final_rate or 'N/A'}\n"
-                f"방식: {method}\n"
+                f"방식: CRF 0 무손실 (프레임 정확)\n"
                 f"상태: {match}")
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
