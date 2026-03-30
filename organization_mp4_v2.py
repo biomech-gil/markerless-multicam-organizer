@@ -282,7 +282,7 @@ class SetMatcher:
         subfolders = sorted([
             d for d in os.listdir(root_folder)
             if os.path.isdir(os.path.join(root_folder, d))
-            and d not in (FileHistoryManager.HISTORY_DIR, SetGridViewer.PROXY_DIR)
+            and d != FileHistoryManager.HISTORY_DIR
         ], key=natural_sort_key)
 
         all_files = []
@@ -715,8 +715,7 @@ class VideoOrganizer:
 # 5. SetGridViewer: 세트 그리드 프리뷰어
 # ─────────────────────────────────────────────
 class SetGridViewer(tk.Toplevel):
-    PROXY_DIR = ".proxy"
-    PROXY_WIDTH = 640  # 프록시 가로 해상도
+    DECODE_WIDTH = 480  # 디코딩 후 즉시 리사이즈할 최대 폭
 
     def __init__(self, parent, matched_sets, root_folder=None):
         super().__init__(parent)
@@ -733,12 +732,6 @@ class SetGridViewer(tk.Toplevel):
         self.captures = {}
         self.photo_images = []
         self.playing = False
-
-        # 프록시 디렉토리
-        self.proxy_dir = None
-        if root_folder:
-            self.proxy_dir = os.path.join(root_folder, self.PROXY_DIR)
-            os.makedirs(self.proxy_dir, exist_ok=True)
         self.play_speed = 33      # ms (~30fps, 1x)
         self.frame_step = 1
         self.step_buttons = {}    # {step_value: Button}
@@ -842,123 +835,6 @@ class SetGridViewer(tk.Toplevel):
         # 기본 선택 하이라이트
         self.speed_buttons[33].config(bg='#2196F3')
 
-    # ── 프록시 생성 (GPU 가속 + 병렬) ──
-
-    _proxy_encoder = None  # 클래스 레벨 캐시: None=미감지, 'unavailable', (hwaccel, encoder)
-
-    @classmethod
-    def _detect_encoder(cls):
-        """최적 ffmpeg 인코더를 감지한다. GPU 우선, 소프트웨어 폴백."""
-        if cls._proxy_encoder is not None:
-            return
-
-        # (hwaccel_args, encoder_args) — GPU 빠른 순서대로 시도
-        candidates = [
-            # NVIDIA NVENC + CUDA 디코딩
-            (['-hwaccel', 'cuda'],
-             ['-c:v', 'h264_nvenc', '-preset', 'p1']),
-            # NVIDIA NVENC (소프트웨어 디코딩)
-            ([],
-             ['-c:v', 'h264_nvenc', '-preset', 'p1']),
-            # Intel Quick Sync
-            ([],
-             ['-c:v', 'h264_qsv', '-preset', 'veryfast']),
-            # AMD AMF
-            ([],
-             ['-c:v', 'h264_amf', '-quality', 'speed']),
-            # 소프트웨어 폴백
-            ([],
-             ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '28']),
-        ]
-
-        for hwaccel, encoder in candidates:
-            try:
-                cmd = (['ffmpeg', '-f', 'lavfi', '-i',
-                        'color=c=black:s=64x64:d=0.1', '-frames:v', '1']
-                       + encoder + ['-f', 'null', '-'])
-                result = subprocess.run(cmd, capture_output=True, timeout=10)
-                if result.returncode == 0:
-                    cls._proxy_encoder = (hwaccel, encoder)
-                    return
-            except FileNotFoundError:
-                cls._proxy_encoder = 'unavailable'
-                return
-            except subprocess.TimeoutExpired:
-                continue
-
-        cls._proxy_encoder = 'unavailable'
-
-    def _get_proxy_path(self, video):
-        """비디오에 대응하는 프록시 파일 경로를 반환한다."""
-        if not self.proxy_dir:
-            return None
-        proxy_name = f"{video.folder}_{video.filename}"
-        return os.path.join(self.proxy_dir, proxy_name)
-
-    def _generate_proxies_for_set(self, cam_dict):
-        """세트의 모든 카메라 프록시를 병렬 생성한다.
-        GPU 인코더를 자동 감지하고, 모든 카메라를 동시에 인코딩."""
-        if not self.proxy_dir:
-            return {}
-
-        # 인코더 감지 (최초 1회)
-        self._detect_encoder()
-        if self._proxy_encoder == 'unavailable':
-            return {cam: cam_dict[cam].filepath for cam in cam_dict}
-
-        hwaccel, encoder = self._proxy_encoder
-        w = self.PROXY_WIDTH
-
-        cams = sorted(cam_dict.keys(), key=natural_sort_key)
-        proxy_paths = {}
-        need_gen = []
-
-        for cam in cams:
-            video = cam_dict[cam]
-            pp = self._get_proxy_path(video)
-            if pp and os.path.exists(pp):
-                proxy_paths[cam] = pp
-            elif pp:
-                need_gen.append((cam, video, pp))
-            else:
-                proxy_paths[cam] = video.filepath
-
-        if not need_gen:
-            return proxy_paths
-
-        encoder_name = encoder[1]  # e.g. 'h264_nvenc'
-        self.set_label.config(
-            text=f"프록시 생성 중... ({len(need_gen)}개 병렬, {encoder_name})")
-        self.update()
-
-        # 모든 카메라 ffmpeg를 동시 실행
-        procs = {}
-        for cam, video, pp in need_gen:
-            cmd = (['ffmpeg'] + hwaccel +
-                   ['-i', video.filepath, '-vf', f'scale={w}:-2'] +
-                   encoder + ['-an', '-y', pp])
-            try:
-                proc = subprocess.Popen(
-                    cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                procs[cam] = (proc, pp, video)
-            except Exception:
-                proxy_paths[cam] = video.filepath
-
-        # 완료 대기
-        done = 0
-        for cam, (proc, pp, video) in procs.items():
-            proc.wait()
-            done += 1
-            self.set_label.config(
-                text=f"프록시 생성 중... ({done}/{len(procs)} 완료)")
-            self.update()
-            if proc.returncode == 0 and os.path.exists(pp):
-                proxy_paths[cam] = pp
-            else:
-                proxy_paths[cam] = video.filepath
-
-        return proxy_paths
-
     def _release_captures(self):
         # 진행 중인 프리페치 완료 대기
         if self._prefetching and self._prefetch_thread is not None:
@@ -992,16 +868,12 @@ class SetGridViewer(tk.Toplevel):
         self.set_label.config(
             text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)})")
 
-        # 프록시 생성 (필요 시)
-        proxy_paths = self._generate_proxies_for_set(cam_dict)
-
-        # 캡처 열기 (프록시 또는 원본)
+        # 캡처 열기
         self.cam_names = sorted(cam_dict.keys(), key=natural_sort_key)
         max_frames = 0
         for cam in self.cam_names:
             video = cam_dict[cam]
-            filepath = proxy_paths.get(cam, video.filepath)
-            cap = cv2.VideoCapture(filepath)
+            cap = cv2.VideoCapture(video.filepath)
             self.captures[cam] = cap
             fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if fc > max_frames:
@@ -1010,13 +882,6 @@ class SetGridViewer(tk.Toplevel):
         self.max_frames = max(max_frames - 1, 0)
         self.frame_slider.config(to=self.max_frames)
         self.frame_slider.set(0)
-
-        # 프록시 사용 여부 표시
-        using_proxy = any(proxy_paths.get(c) != cam_dict[c].filepath
-                          for c in self.cam_names if c in proxy_paths)
-        proxy_tag = "  [프록시]" if using_proxy else ""
-        self.set_label.config(
-            text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)}){proxy_tag}")
 
         # 병렬 디코딩용 스레드 풀 생성
         n_workers = min(len(self.cam_names), os.cpu_count() or 4)
@@ -1058,6 +923,13 @@ class SetGridViewer(tk.Toplevel):
         self._show_frame(0)
 
     # ── 병렬 디코딩 엔진 ──
+    #
+    # 최적화 전략:
+    #   1) grab/retrieve 분리 — grab()은 디코딩만, retrieve()는 마지막 1장만
+    #   2) 프레임 스텝 시 중간 프레임은 grab()으로 빠르게 건너뜀
+    #   3) 디코딩 직후 DECODE_WIDTH 크기로 축소 (메모리·처리량 감소)
+    #   4) 모든 카메라를 ThreadPoolExecutor로 병렬 처리
+    #   5) 연속 재생 시 seek 생략 + 다음 프레임 프리페치
 
     def _decode_cam_frame(self, cam, frame_no):
         """단일 카메라 프레임 디코딩 (워커 스레드에서 실행)"""
@@ -1065,9 +937,15 @@ class SetGridViewer(tk.Toplevel):
         if cap is None:
             return cam, None
 
-        # 연속 재생 시 seek 생략 (순차 read가 훨씬 빠름)
-        if self._cam_next_frame.get(cam) != frame_no:
+        expected = self._cam_next_frame.get(cam, -1)
+
+        if expected != frame_no:
+            # 불연속 — seek 필요
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)
+        elif expected == frame_no and self.frame_step > 1:
+            # 연속이지만 스텝 > 1 — 이전 _show_frame에서 이미 step-1만큼
+            # grab 해뒀으므로 여기서는 바로 retrieve
+            pass
 
         ret, frame = cap.read()
         if not ret:
@@ -1075,7 +953,16 @@ class SetGridViewer(tk.Toplevel):
 
         self._cam_next_frame[cam] = frame_no + 1
 
-        # 리사이즈 + 색 변환도 워커 스레드에서 처리
+        # 즉시 저해상도로 축소 (이후 처리량 대폭 감소)
+        h, w = frame.shape[:2]
+        if w > self.DECODE_WIDTH:
+            scale = self.DECODE_WIDTH / w
+            new_w = self.DECODE_WIDTH
+            new_h = max(int(h * scale), 1)
+            frame = cv2.resize(frame, (new_w, new_h),
+                               interpolation=cv2.INTER_NEAREST)
+
+        # 디스플레이 크기에 맞춰 최종 리사이즈 + 색 변환
         lw, lh = self.display_sizes.get(cam, (380, 280))
         h, w = frame.shape[:2]
         scale = min(lw / w, lh / h)
@@ -1083,12 +970,37 @@ class SetGridViewer(tk.Toplevel):
         new_h = max(int(h * scale), 1)
 
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        frame_resized = cv2.resize(frame_rgb, (new_w, new_h))
-        return cam, frame_resized
+        if (new_w, new_h) != (w, h):
+            frame_rgb = cv2.resize(frame_rgb, (new_w, new_h),
+                                   interpolation=cv2.INTER_NEAREST)
+        return cam, frame_rgb
+
+    def _grab_skip(self, steps):
+        """모든 카메라에서 steps 프레임을 grab()으로 빠르게 건너뛴다.
+        grab()은 프레임 데이터를 메모리에 복사하지 않아 read()보다 훨씬 빠름."""
+        if steps <= 0:
+            return
+
+        def grab_cam(cam):
+            cap = self.captures.get(cam)
+            if cap is None:
+                return
+            for _ in range(steps):
+                if not cap.grab():
+                    break
+            # grab 후 다음 예상 프레임 갱신
+            self._cam_next_frame[cam] = (
+                self._cam_next_frame.get(cam, 0) + steps)
+
+        futures = [self.decode_executor.submit(grab_cam, cam)
+                   for cam in self.cam_names]
+        for f in futures:
+            f.result()
 
     def _decode_all_parallel(self, frame_no):
         """모든 카메라를 병렬로 디코딩"""
-        futures = {cam: self.decode_executor.submit(self._decode_cam_frame, cam, frame_no)
+        futures = {cam: self.decode_executor.submit(
+                       self._decode_cam_frame, cam, frame_no)
                    for cam in self.cam_names}
         results = {}
         for cam, future in futures.items():
@@ -1170,8 +1082,27 @@ class SetGridViewer(tk.Toplevel):
         if frame_no != self.current_frame:
             self._show_frame(frame_no)
 
+    def _advance_step(self):
+        """현재 위치에서 frame_step만큼 전진.
+        연속 흐름이면 grab()으로 중간 프레임을 빠르게 건너뛴다."""
+        next_frame = self.current_frame + self.frame_step
+        if next_frame > self.max_frames:
+            return -1
+
+        # 연속인지 확인 (모든 카메라의 다음 예상 프레임이 일치)
+        is_sequential = all(
+            self._cam_next_frame.get(cam, -1) == self.current_frame + 1
+            for cam in self.cam_names)
+
+        if is_sequential and self.frame_step > 1:
+            # 중간 (step-1)장을 grab()으로 빠르게 건너뜀
+            self._grab_skip(self.frame_step - 1)
+
+        self._show_frame(next_frame)
+        return next_frame
+
     def _next_frame(self):
-        self._show_frame(self.current_frame + self.frame_step)
+        self._advance_step()
 
     def _prev_frame(self):
         self._show_frame(self.current_frame - self.frame_step)
@@ -1193,14 +1124,15 @@ class SetGridViewer(tk.Toplevel):
     def _play_loop(self):
         if not self.playing:
             return
-        next_frame = self.current_frame + self.frame_step
-        if next_frame > self.max_frames:
+        result = self._advance_step()
+        if result < 0:
             self.playing = False
             self.play_btn.config(text="▶")
             return
-        self._show_frame(next_frame)
-        # 재생 중 다음 프레임 미리 디코딩
-        self._start_prefetch(next_frame + self.frame_step)
+        # 재생 중 다음 프레임 미리 프리페치
+        prefetch_target = self.current_frame + self.frame_step
+        if prefetch_target <= self.max_frames:
+            self._start_prefetch(prefetch_target)
         self.after(self.play_speed, self._play_loop)
 
     def _set_step(self, step):
@@ -1687,8 +1619,7 @@ class VideoOrganizerGUI:
             return
         idx = int(selection[0])
         if 0 <= idx < len(self.matcher.matched_sets):
-            SetGridViewer(self.root, [self.matcher.matched_sets[idx]],
-                         root_folder=self.organizer.root_folder)
+            SetGridViewer(self.root, [self.matcher.matched_sets[idx]])
 
     def _preview_selected_sets(self):
         """선택된 세트들만 프리뷰"""
@@ -1701,16 +1632,14 @@ class VideoOrganizerGUI:
         selected_sets = [self.matcher.matched_sets[i] for i in indices
                          if 0 <= i < len(self.matcher.matched_sets)]
         if selected_sets:
-            SetGridViewer(self.root, selected_sets,
-                         root_folder=self.organizer.root_folder)
+            SetGridViewer(self.root, selected_sets)
 
     def _preview_all_sets(self):
         """전체 세트 프리뷰"""
         if not self.matcher.matched_sets:
             messagebox.showwarning("경고", "먼저 Step 1 (스캔 & 매칭)을 실행하세요.")
             return
-        SetGridViewer(self.root, self.matcher.matched_sets,
-                     root_folder=self.organizer.root_folder)
+        SetGridViewer(self.root, self.matcher.matched_sets)
 
     # ── 폴더 선택 ──
     def select_folder(self):
