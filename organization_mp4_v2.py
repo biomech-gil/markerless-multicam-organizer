@@ -399,7 +399,50 @@ class SetMatcher:
         if self.calibration_videos:
             self.matched_sets.insert(0, ("C0001", dict(self.calibration_videos)))
 
+        # CNNNN 단조증가 강제 적용
+        self._enforce_cnnnn_order()
+
         return self.matched_sets
+
+    @staticmethod
+    def _get_cnnnn(video):
+        """파일명에서 CNNNN 시퀀스 번호를 추출한다. 없으면 -1."""
+        m = re.match(r'[A-Za-z]\d{3}C(\d+)', video.filename)
+        return int(m.group(1)) if m else -1
+
+    def _enforce_cnnnn_order(self):
+        """각 카메라에서 세트 순서대로 CNNNN이 단조증가하도록 재배치한다.
+
+        duration 매칭이 CNNNN 순서를 깨뜨린 경우, 카메라별로
+        파일을 CNNNN 순서로 재정렬하여 세트에 재배치한다.
+        세트 구조(어떤 세트에 어떤 카메라가 포함되는지)는 유지된다.
+        """
+        # 캘리브레이션 세트(C0001)는 제외
+        start_idx = 1 if self.calibration_videos else 0
+
+        cam_names = set()
+        for idx in range(start_idx, len(self.matched_sets)):
+            cam_names.update(self.matched_sets[idx][1].keys())
+
+        for cam in cam_names:
+            # 이 카메라가 포함된 세트 인덱스 + 비디오 수집
+            entries = []
+            for idx in range(start_idx, len(self.matched_sets)):
+                cam_dict = self.matched_sets[idx][1]
+                if cam in cam_dict:
+                    entries.append((idx, cam_dict[cam]))
+
+            if len(entries) < 2:
+                continue
+
+            # CNNNN 순서로 비디오만 정렬
+            videos_sorted = sorted(
+                [video for _, video in entries],
+                key=lambda v: self._get_cnnnn(v))
+
+            # 원래 세트 순서대로 정렬된 비디오 재배치
+            for i, (set_idx, _) in enumerate(entries):
+                self.matched_sets[set_idx][1][cam] = videos_sorted[i]
 
     def get_rename_plan(self):
         plan = []
