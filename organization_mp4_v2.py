@@ -929,13 +929,19 @@ class SetGridViewer(tk.Toplevel):
         self._load_first_frame_async()
 
     def _load_first_frame_async(self):
-        """첫 프레임을 백그라운드에서 디코딩하여 UI를 블로킹하지 않는다."""
-        def do_decode():
-            data = self._decode_all_parallel(0)
-            # 메인 스레드에서 UI 갱신
-            self.after(0, lambda: self._apply_frame_data(data, 0))
+        """첫 프레임을 백그라운드에서 디코딩하여 UI를 블로킹하지 않는다.
+        프리페치 플래그를 사용하여 재생 시작 전 완료를 보장한다."""
+        self._prefetching = True
 
-        threading.Thread(target=do_decode, daemon=True).start()
+        def do_decode():
+            try:
+                data = self._decode_all_parallel(0)
+                self.after(0, lambda d=data: self._apply_frame_data(d, 0))
+            finally:
+                self._prefetching = False
+
+        self._prefetch_thread = threading.Thread(target=do_decode, daemon=True)
+        self._prefetch_thread.start()
 
     def _apply_frame_data(self, frame_data, frame_no):
         """디코딩된 프레임 데이터를 UI에 반영한다."""
@@ -1102,7 +1108,14 @@ class SetGridViewer(tk.Toplevel):
     def _on_slider(self, val):
         frame_no = int(float(val))
         if frame_no != self.current_frame:
+            self._wait_for_pending_decode()
             self._show_frame(frame_no)
+
+    def _wait_for_pending_decode(self):
+        """진행 중인 백그라운드 디코딩(프리페치/첫프레임) 완료를 대기한다."""
+        if self._prefetching and self._prefetch_thread is not None:
+            self._prefetch_thread.join()
+            self._prefetching = False
 
     def _advance_step(self):
         """현재 위치에서 frame_step만큼 전진.
@@ -1110,6 +1123,9 @@ class SetGridViewer(tk.Toplevel):
         next_frame = self.current_frame + self.frame_step
         if next_frame > self.max_frames:
             return -1
+
+        # 캡처 충돌 방지: 백그라운드 디코딩 완료 대기
+        self._wait_for_pending_decode()
 
         # 연속인지 확인 (모든 카메라의 다음 예상 프레임이 일치)
         is_sequential = all(
