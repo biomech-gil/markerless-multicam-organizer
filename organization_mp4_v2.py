@@ -999,8 +999,11 @@ class SetGridViewer(tk.Toplevel):
             name_lbl.pack(fill=tk.X)
             self.grid_name_labels[cam] = name_lbl
 
-            img_lbl = tk.Label(cell, bg='black', text='로딩 중...', fg='gray')
+            img_lbl = tk.Label(cell, bg='black', text='로딩 중...', fg='gray',
+                               cursor='hand2')
             img_lbl.pack(fill=tk.BOTH, expand=True)
+            img_lbl.bind('<Double-1>',
+                         lambda e, c=cam: self._open_trimmer(c))
             self.grid_labels[cam] = img_lbl
 
             # 파일 선택 Combobox (cam_folders가 있을 때만)
@@ -1307,6 +1310,13 @@ class SetGridViewer(tk.Toplevel):
             return
         if 0 <= idx < len(self.matched_sets):
             self._load_set(idx)
+
+    def _open_trimmer(self, cam):
+        """더블클릭 시 해당 카메라의 현재 영상을 편집기로 연다."""
+        set_name, cam_dict = self.matched_sets[self.current_set_idx]
+        video = cam_dict.get(cam)
+        if video:
+            VideoTrimmerDialog(self, initial_file=video.filepath)
 
     def _on_file_change(self, cam):
         """카메라의 파일을 변경하고 프리뷰를 갱신한다 (임시 변경)."""
@@ -1715,12 +1725,13 @@ class CalibrationDialog(tk.Toplevel):
 # ─────────────────────────────────────────────
 class VideoTrimmerDialog(tk.Toplevel):
     """MP4 영상에서 유지할 구간을 선택하고, 나머지를 잘라내어
-    이어붙인 새 파일로 내보내는 편집기. ffmpeg -c copy로 화질 무손실."""
+    이어붙인 새 파일로 내보낸다. ffmpeg -c copy (무손실, 메타 동일)."""
 
-    def __init__(self, parent):
+    def __init__(self, parent, initial_file=None):
         super().__init__(parent)
-        self.title("영상 구간 편집기 — 구간 선택 후 이어붙이기")
-        self.geometry("950x750")
+        self.title("영상 구간 편집기")
+        self.geometry("800x600")
+        self.minsize(600, 450)
 
         self.filepath = None
         self.cap = None
@@ -1729,7 +1740,7 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.current_frame = 0
         self.playing = False
         self.photo_image = None
-        self.segments = []   # [(start_frame, end_frame), ...]
+        self.segments = []
         self.mark_in = None
 
         self._setup_ui()
@@ -1740,51 +1751,35 @@ class VideoTrimmerDialog(tk.Toplevel):
         self.bind('i', lambda e: self._set_mark_in())
         self.bind('o', lambda e: self._add_segment())
 
+        if initial_file:
+            self.after(50, lambda: self._load_file(initial_file))
+
     def _setup_ui(self):
-        # 상단: 파일 열기
-        top = tk.Frame(self, bg='#333')
-        top.pack(fill=tk.X)
-        tk.Button(top, text="파일 열기", command=self._open_file,
-                  bg='#2196F3', fg='white', width=10).pack(side=tk.LEFT, padx=5, pady=5)
-        self.file_label = tk.Label(top, text="파일을 선택하세요",
-                                   bg='#333', fg='white', anchor='w')
-        self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        # ── 하단 고정 영역 (먼저 pack → 절대 안 잘림) ──
+        bottom_fixed = tk.Frame(self)
+        bottom_fixed.pack(side=tk.BOTTOM, fill=tk.X)
 
-        # 비디오 프리뷰
-        self.preview_label = tk.Label(self, bg='black', text='영상 없음', fg='gray')
-        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        # 내보내기 + 삭제
+        export_row = tk.Frame(bottom_fixed, bg='#333')
+        export_row.pack(fill=tk.X, padx=5, pady=3)
+        tk.Button(export_row, text="내보내기 (무손실)",
+                  command=self._export, bg='#9C27B0', fg='white',
+                  width=18).pack(side=tk.RIGHT, padx=3)
+        tk.Button(export_row, text="구간 삭제",
+                  command=self._delete_segment, bg='#f44336', fg='white',
+                  width=8).pack(side=tk.RIGHT, padx=3)
+        tk.Label(export_row, text="ffmpeg -c copy: fps·해상도·코덱 100% 동일",
+                 bg='#333', fg='#888', font=('Arial', 8)).pack(side=tk.LEFT, padx=5)
 
-        # 슬라이더
-        self.frame_slider = tk.Scale(self, from_=0, to=0, orient=tk.HORIZONTAL,
-                                     bg='#333', fg='white', highlightthickness=0,
-                                     command=self._on_slider)
-        self.frame_slider.pack(fill=tk.X, padx=10)
+        # 구간 목록
+        seg_frame = tk.LabelFrame(bottom_fixed, text="유지할 구간 (이 부분만 이어붙여 저장)")
+        seg_frame.pack(fill=tk.X, padx=5, pady=2)
+        self.seg_listbox = tk.Listbox(seg_frame, height=3, font=('Consolas', 9))
+        self.seg_listbox.pack(fill=tk.X, padx=3, pady=3)
 
-        # 재생 컨트롤
-        ctrl = tk.Frame(self, bg='#333')
-        ctrl.pack(fill=tk.X, padx=10, pady=3)
-
-        tk.Button(ctrl, text="◀◀", width=4, command=lambda: self._step(-30),
-                  bg='#555', fg='white').pack(side=tk.LEFT, padx=1)
-        tk.Button(ctrl, text="◀", width=4, command=lambda: self._step(-1),
-                  bg='#555', fg='white').pack(side=tk.LEFT, padx=1)
-        self.play_btn = tk.Button(ctrl, text="▶", width=6,
-                                  command=self._toggle_play,
-                                  bg='#4CAF50', fg='white')
-        self.play_btn.pack(side=tk.LEFT, padx=1)
-        tk.Button(ctrl, text="▶", width=4, command=lambda: self._step(1),
-                  bg='#555', fg='white').pack(side=tk.LEFT, padx=1)
-        tk.Button(ctrl, text="▶▶", width=4, command=lambda: self._step(30),
-                  bg='#555', fg='white').pack(side=tk.LEFT, padx=1)
-
-        self.frame_label = tk.Label(ctrl, text="Frame: 0/0  (00:00.000)",
-                                    bg='#333', fg='white')
-        self.frame_label.pack(side=tk.LEFT, padx=15)
-
-        # 구간 선택
-        mark = tk.Frame(self, bg='#444')
-        mark.pack(fill=tk.X, padx=10, pady=3)
-
+        # 구간 마크 버튼
+        mark = tk.Frame(bottom_fixed, bg='#444')
+        mark.pack(fill=tk.X, padx=5, pady=2)
         tk.Button(mark, text="[ 시작점 (I)", command=self._set_mark_in,
                   bg='#FF9800', fg='white', width=12).pack(side=tk.LEFT, padx=3)
         self.mark_label = tk.Label(mark, text="시작점: —", bg='#444', fg='white')
@@ -1792,28 +1787,52 @@ class VideoTrimmerDialog(tk.Toplevel):
         tk.Button(mark, text="끝점 ] → 추가 (O)", command=self._add_segment,
                   bg='#4CAF50', fg='white', width=16).pack(side=tk.LEFT, padx=3)
 
-        # 하단: 구간 목록 + 내보내기 (항상 보이도록 먼저 pack)
-        bottom = tk.Frame(self)
-        bottom.pack(side=tk.BOTTOM, fill=tk.X, padx=10, pady=5)
+        # 재생 컨트롤 + 프레임 정보
+        ctrl = tk.Frame(bottom_fixed, bg='#333')
+        ctrl.pack(fill=tk.X, padx=5, pady=2)
+        for txt, step in [("◀◀", -30), ("◀", -1)]:
+            tk.Button(ctrl, text=txt, width=4, bg='#555', fg='white',
+                      command=lambda s=step: self._step(s)).pack(side=tk.LEFT, padx=1)
+        self.play_btn = tk.Button(ctrl, text="▶", width=6,
+                                  command=self._toggle_play,
+                                  bg='#4CAF50', fg='white')
+        self.play_btn.pack(side=tk.LEFT, padx=1)
+        for txt, step in [("▶", 1), ("▶▶", 30)]:
+            tk.Button(ctrl, text=txt, width=4, bg='#555', fg='white',
+                      command=lambda s=step: self._step(s)).pack(side=tk.LEFT, padx=1)
+        self.frame_label = tk.Label(ctrl, text="Frame: 0/0  (00:00.000)",
+                                    bg='#333', fg='white')
+        self.frame_label.pack(side=tk.LEFT, padx=10)
 
-        tk.Button(bottom, text="내보내기 (ffmpeg -c copy)", command=self._export,
-                  bg='#9C27B0', fg='white', width=25, height=2
-                  ).pack(side=tk.RIGHT, padx=5)
-        tk.Button(bottom, text="선택 삭제", command=self._delete_segment,
-                  bg='#f44336', fg='white', width=10).pack(side=tk.RIGHT, padx=5)
+        # 슬라이더
+        self.frame_slider = tk.Scale(bottom_fixed, from_=0, to=0,
+                                     orient=tk.HORIZONTAL, bg='#333', fg='white',
+                                     highlightthickness=0, command=self._on_slider)
+        self.frame_slider.pack(fill=tk.X, padx=5, pady=2)
 
-        seg_frame = tk.LabelFrame(self, text="유지할 구간 목록 (이 구간들만 이어붙여 저장)")
-        seg_frame.pack(fill=tk.X, padx=10, pady=3)
-        self.seg_listbox = tk.Listbox(seg_frame, height=4, font=('Consolas', 10))
-        self.seg_listbox.pack(fill=tk.X, padx=5, pady=5)
+        # ── 상단 영역 ──
+        top = tk.Frame(self, bg='#333')
+        top.pack(side=tk.TOP, fill=tk.X)
+        tk.Button(top, text="파일 열기", command=self._open_file,
+                  bg='#2196F3', fg='white', width=10).pack(side=tk.LEFT, padx=5, pady=4)
+        self.file_label = tk.Label(top, text="파일을 선택하세요",
+                                   bg='#333', fg='white', anchor='w')
+        self.file_label.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+
+        # ── 프리뷰 (나머지 공간 전부 차지) ──
+        self.preview_label = tk.Label(self, bg='black', text='영상 없음',
+                                      fg='gray', cursor='hand2')
+        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=2)
 
     # ── 파일 ──
 
     def _open_file(self):
         filepath = filedialog.askopenfilename(
             filetypes=[("MP4 파일", "*.mp4"), ("모든 영상", "*.*")])
-        if not filepath:
-            return
+        if filepath:
+            self._load_file(filepath)
+
+    def _load_file(self, filepath):
         if self.cap:
             self.cap.release()
         self.filepath = filepath
@@ -1852,7 +1871,7 @@ class VideoTrimmerDialog(tk.Toplevel):
 
         self.preview_label.update_idletasks()
         lw = max(self.preview_label.winfo_width(), 320)
-        lh = max(self.preview_label.winfo_height(), 240)
+        lh = max(self.preview_label.winfo_height(), 180)
         h, w = frame.shape[:2]
         scale = min(lw / w, lh / h)
         nw, nh = max(int(w * scale), 1), max(int(h * scale), 1)
@@ -1934,15 +1953,13 @@ class VideoTrimmerDialog(tk.Toplevel):
 
         base = os.path.splitext(os.path.basename(self.filepath))[0]
         output = filedialog.asksaveasfilename(
-            defaultextension=".mp4",
-            filetypes=[("MP4", "*.mp4")],
+            defaultextension=".mp4", filetypes=[("MP4", "*.mp4")],
             initialfile=f"{base}_trimmed.mp4")
         if not output:
             return
 
         import tempfile
         temp_dir = tempfile.mkdtemp()
-
         try:
             seg_files = []
             for i, (s, e) in enumerate(self.segments):
@@ -1961,7 +1978,6 @@ class VideoTrimmerDialog(tk.Toplevel):
                     return
                 seg_files.append(seg_path)
 
-            # concat 목록
             list_path = os.path.join(temp_dir, "list.txt")
             with open(list_path, 'w', encoding='utf-8') as f:
                 for p in seg_files:
@@ -1976,7 +1992,8 @@ class VideoTrimmerDialog(tk.Toplevel):
                 total_f = sum(e - s for s, e in self.segments)
                 messagebox.showinfo("완료",
                     f"내보내기 완료!\n{output}\n\n"
-                    f"{len(self.segments)}개 구간, {total_f}프레임")
+                    f"{len(self.segments)}개 구간, {total_f}프레임\n"
+                    f"fps·해상도·코덱 원본과 동일")
             else:
                 messagebox.showerror("오류",
                     f"병합 실패:\n{r.stderr.decode(errors='replace')[:500]}")
