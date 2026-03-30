@@ -1768,11 +1768,18 @@ class VideoTrimmerDialog(tk.Toplevel):
         tk.Button(export_row, text="구간 삭제",
                   command=self._delete_segment, bg='#f44336', fg='white',
                   width=8).pack(side=tk.RIGHT, padx=3)
-        tk.Label(export_row, text="ffmpeg -c copy: fps·해상도·코덱 100% 동일",
+        tk.Button(export_row, text="구간 수정",
+                  command=self._update_segment, bg='#FF9800', fg='white',
+                  width=8).pack(side=tk.RIGHT, padx=3)
+        tk.Button(export_row, text="끝으로",
+                  command=self._goto_seg_end, bg='#555', fg='white',
+                  width=6).pack(side=tk.RIGHT, padx=3)
+        tk.Label(export_row, text="구간 선택 → 시작점 이동  |  입력창 수정 후 '구간 수정'",
                  bg='#333', fg='#888', font=('Arial', 8)).pack(side=tk.LEFT, padx=5)
 
         # 구간 목록
-        seg_frame = tk.LabelFrame(bottom_fixed, text="유지할 구간 (이 부분만 이어붙여 저장)")
+        seg_frame = tk.LabelFrame(bottom_fixed,
+                                  text="유지할 구간 (클릭: 시작점 이동 + 입력창 반영)")
         seg_frame.pack(fill=tk.X, padx=5, pady=2)
         self.seg_listbox = tk.Listbox(seg_frame, height=3, font=('Consolas', 9))
         self.seg_listbox.pack(fill=tk.X, padx=3, pady=3)
@@ -2016,6 +2023,50 @@ class VideoTrimmerDialog(tk.Toplevel):
             self.seg_listbox.insert(tk.END,
                 f"  {i + 1}.  F{s}~F{e} ({e - s}f)  |  "
                 f"{ss:.3f}s~{se:.3f}s ({dur:.3f}s)")
+        # 리스트 클릭 바인딩
+        self.seg_listbox.bind('<<ListboxSelect>>', self._on_segment_select)
+
+    def _on_segment_select(self, event=None):
+        """구간 리스트 클릭 시 시작점으로 이동 + 입력창에 값 반영."""
+        sel = self.seg_listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        s, e = self.segments[idx]
+        # 입력창에 프레임 값 반영
+        self.in_entry.delete(0, tk.END)
+        self.in_entry.insert(0, str(s))
+        self.out_entry.delete(0, tk.END)
+        self.out_entry.insert(0, str(e))
+        self.unit_var.set("frame")
+        # 시작 프레임으로 이동
+        self._show_frame(s)
+
+    def _goto_seg_end(self):
+        """선택된 구간의 끝점으로 이동."""
+        sel = self.seg_listbox.curselection()
+        if not sel:
+            return
+        _, e = self.segments[sel[0]]
+        self._show_frame(e)
+
+    def _update_segment(self):
+        """선택된 구간의 시작/끝을 입력창 값으로 수정."""
+        sel = self.seg_listbox.curselection()
+        if not sel:
+            messagebox.showwarning("경고", "수정할 구간을 리스트에서 선택하세요.")
+            return
+        new_s = self._parse_time_input(self.in_entry.get())
+        new_e = self._parse_time_input(self.out_entry.get())
+        if new_s is None or new_e is None:
+            messagebox.showwarning("경고", "시작/끝 값을 올바르게 입력하세요.")
+            return
+        if new_e <= new_s:
+            messagebox.showwarning("경고", "끝 값이 시작보다 커야 합니다.")
+            return
+        self.segments[sel[0]] = (new_s, new_e)
+        self.segments.sort()
+        self._refresh_segments()
 
     def _delete_segment(self):
         sel = self.seg_listbox.curselection()
