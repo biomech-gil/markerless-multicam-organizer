@@ -282,7 +282,7 @@ class SetMatcher:
         subfolders = sorted([
             d for d in os.listdir(root_folder)
             if os.path.isdir(os.path.join(root_folder, d))
-            and d != FileHistoryManager.HISTORY_DIR
+            and d not in (FileHistoryManager.HISTORY_DIR, SetGridViewer.PROXY_DIR)
         ], key=natural_sort_key)
 
         all_files = []
@@ -715,7 +715,10 @@ class VideoOrganizer:
 # 5. SetGridViewer: 세트 그리드 프리뷰어
 # ─────────────────────────────────────────────
 class SetGridViewer(tk.Toplevel):
-    def __init__(self, parent, matched_sets):
+    PROXY_DIR = ".proxy"
+    PROXY_WIDTH = 640  # 프록시 가로 해상도
+
+    def __init__(self, parent, matched_sets, root_folder=None):
         super().__init__(parent)
         self.title("세트 프리뷰어 - 프레임 비교")
         # 화면 크기에 맞춰 창 크기 설정 (작업표시줄 고려)
@@ -730,6 +733,12 @@ class SetGridViewer(tk.Toplevel):
         self.captures = {}
         self.photo_images = []
         self.playing = False
+
+        # 프록시 디렉토리
+        self.proxy_dir = None
+        if root_folder:
+            self.proxy_dir = os.path.join(root_folder, self.PROXY_DIR)
+            os.makedirs(self.proxy_dir, exist_ok=True)
         self.play_speed = 33      # ms (~30fps, 1x)
         self.frame_step = 1
         self.step_buttons = {}    # {step_value: Button}
@@ -833,6 +842,69 @@ class SetGridViewer(tk.Toplevel):
         # 기본 선택 하이라이트
         self.speed_buttons[33].config(bg='#2196F3')
 
+    # ── 프록시 생성 ──
+
+    def _get_proxy_path(self, video):
+        """비디오에 대응하는 프록시 파일 경로를 반환한다."""
+        if not self.proxy_dir:
+            return None
+        proxy_name = f"{video.folder}_{video.filename}"
+        return os.path.join(self.proxy_dir, proxy_name)
+
+    def _ensure_proxy(self, video):
+        """프록시 파일이 없으면 생성하고, 경로를 반환한다."""
+        proxy_path = self._get_proxy_path(video)
+        if proxy_path is None:
+            return video.filepath
+
+        if os.path.exists(proxy_path):
+            return proxy_path
+
+        # ffmpeg로 저해상도 프록시 생성
+        try:
+            result = subprocess.run([
+                'ffmpeg', '-i', video.filepath,
+                '-vf', f'scale={self.PROXY_WIDTH}:-2',
+                '-c:v', 'libx264', '-preset', 'ultrafast',
+                '-crf', '28', '-an', '-y', proxy_path
+            ], capture_output=True, timeout=600)
+            if result.returncode == 0 and os.path.exists(proxy_path):
+                return proxy_path
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass
+
+        return video.filepath  # 프록시 실패 시 원본 사용
+
+    def _generate_proxies_for_set(self, cam_dict):
+        """세트의 모든 카메라 프록시를 병렬 생성한다."""
+        if not self.proxy_dir:
+            return {}
+
+        cams = sorted(cam_dict.keys(), key=natural_sort_key)
+        # 생성 필요한 것만 필터
+        need_gen = []
+        proxy_paths = {}
+        for cam in cams:
+            video = cam_dict[cam]
+            pp = self._get_proxy_path(video)
+            if pp and not os.path.exists(pp):
+                need_gen.append((cam, video))
+            proxy_paths[cam] = pp if pp else video.filepath
+
+        if not need_gen:
+            return proxy_paths
+
+        # 진행 상태 표시
+        total = len(need_gen)
+        for i, (cam, video) in enumerate(need_gen):
+            self.set_label.config(
+                text=f"프록시 생성 중... ({i + 1}/{total}) {cam}")
+            self.update()
+            pp = self._ensure_proxy(video)
+            proxy_paths[cam] = pp
+
+        return proxy_paths
+
     def _release_captures(self):
         # 진행 중인 프리페치 완료 대기
         if self._prefetching and self._prefetch_thread is not None:
@@ -866,12 +938,16 @@ class SetGridViewer(tk.Toplevel):
         self.set_label.config(
             text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)})")
 
-        # 캡처 열기
+        # 프록시 생성 (필요 시)
+        proxy_paths = self._generate_proxies_for_set(cam_dict)
+
+        # 캡처 열기 (프록시 또는 원본)
         self.cam_names = sorted(cam_dict.keys(), key=natural_sort_key)
         max_frames = 0
         for cam in self.cam_names:
             video = cam_dict[cam]
-            cap = cv2.VideoCapture(video.filepath)
+            filepath = proxy_paths.get(cam, video.filepath)
+            cap = cv2.VideoCapture(filepath)
             self.captures[cam] = cap
             fc = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             if fc > max_frames:
@@ -880,6 +956,13 @@ class SetGridViewer(tk.Toplevel):
         self.max_frames = max(max_frames - 1, 0)
         self.frame_slider.config(to=self.max_frames)
         self.frame_slider.set(0)
+
+        # 프록시 사용 여부 표시
+        using_proxy = any(proxy_paths.get(c) != cam_dict[c].filepath
+                          for c in self.cam_names if c in proxy_paths)
+        proxy_tag = "  [프록시]" if using_proxy else ""
+        self.set_label.config(
+            text=f"{set_name}  ({idx + 1}/{len(self.matched_sets)}){proxy_tag}")
 
         # 병렬 디코딩용 스레드 풀 생성
         n_workers = min(len(self.cam_names), os.cpu_count() or 4)
@@ -1550,7 +1633,8 @@ class VideoOrganizerGUI:
             return
         idx = int(selection[0])
         if 0 <= idx < len(self.matcher.matched_sets):
-            SetGridViewer(self.root, [self.matcher.matched_sets[idx]])
+            SetGridViewer(self.root, [self.matcher.matched_sets[idx]],
+                         root_folder=self.organizer.root_folder)
 
     def _preview_selected_sets(self):
         """선택된 세트들만 프리뷰"""
@@ -1563,14 +1647,16 @@ class VideoOrganizerGUI:
         selected_sets = [self.matcher.matched_sets[i] for i in indices
                          if 0 <= i < len(self.matcher.matched_sets)]
         if selected_sets:
-            SetGridViewer(self.root, selected_sets)
+            SetGridViewer(self.root, selected_sets,
+                         root_folder=self.organizer.root_folder)
 
     def _preview_all_sets(self):
         """전체 세트 프리뷰"""
         if not self.matcher.matched_sets:
             messagebox.showwarning("경고", "먼저 Step 1 (스캔 & 매칭)을 실행하세요.")
             return
-        SetGridViewer(self.root, self.matcher.matched_sets)
+        SetGridViewer(self.root, self.matcher.matched_sets,
+                     root_folder=self.organizer.root_folder)
 
     # ── 폴더 선택 ──
     def select_folder(self):
