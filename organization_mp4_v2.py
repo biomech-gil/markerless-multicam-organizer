@@ -271,6 +271,11 @@ class SetMatcher:
         self.cam_folders = {}       # {cam_name: [VideoInfo, ...]}
         self.matched_sets = []      # [(set_name, {cam: VideoInfo, ...}), ...]
         self.unmatched = {}         # {cam: [VideoInfo, ...]}
+        self.calibration_videos = {}  # {cam_name: VideoInfo}
+
+    def set_calibration(self, cal_dict):
+        """캘리브레이션 영상 지정. 빈 dict이면 해제."""
+        self.calibration_videos = dict(cal_dict)
 
     def scan_cam_folders(self, root_folder, progress_callback=None):
         self.cam_folders.clear()
@@ -317,13 +322,23 @@ class SetMatcher:
 
         cam_names = sorted(self.cam_folders.keys(), key=natural_sort_key)
 
-        # 기준 카메라 = 파일 수가 가장 적은 카메라
-        ref_cam = min(cam_names, key=lambda c: len(self.cam_folders[c]))
-        ref_videos = list(self.cam_folders[ref_cam])
+        # 캘리브레이션 영상 제외한 작업용 목록
+        working_folders = {}
+        for cam in cam_names:
+            if cam in self.calibration_videos:
+                cal = self.calibration_videos[cam]
+                working_folders[cam] = [v for v in self.cam_folders[cam]
+                                        if v.filepath != cal.filepath]
+            else:
+                working_folders[cam] = list(self.cam_folders[cam])
 
-        # 각 카메라의 인덱스 포인터
+        # 기준 카메라 = 파일 수가 가장 적은 카메라
+        ref_cam = min(cam_names, key=lambda c: len(working_folders[c]))
+        ref_videos = list(working_folders[ref_cam])
+
+        # 캘리브레이션이 있으면 C0002부터 시작
         pointers = {cam: 0 for cam in cam_names}
-        set_index = 1
+        set_index = 2 if self.calibration_videos else 1
 
         for ref_idx, ref_video in enumerate(ref_videos):
             pointers[ref_cam] = ref_idx
@@ -336,7 +351,7 @@ class SetMatcher:
                 if cam == ref_cam:
                     continue
 
-                cam_list = self.cam_folders[cam]
+                cam_list = working_folders[cam]
                 ptr = pointers[cam]
                 found = False
 
@@ -377,8 +392,12 @@ class SetMatcher:
         for cam in cam_names:
             if cam == ref_cam:
                 continue
-            for remaining_idx in range(pointers[cam], len(self.cam_folders[cam])):
-                self.unmatched[cam].append(self.cam_folders[cam][remaining_idx])
+            for remaining_idx in range(pointers[cam], len(working_folders[cam])):
+                self.unmatched[cam].append(working_folders[cam][remaining_idx])
+
+        # 캘리브레이션 세트를 C0001로 맨 앞에 삽입
+        if self.calibration_videos:
+            self.matched_sets.insert(0, ("C0001", dict(self.calibration_videos)))
 
         return self.matched_sets
 
@@ -1175,7 +1194,106 @@ class RenamePlanDialog(tk.Toplevel):
 
 
 # ─────────────────────────────────────────────
-# 7. 메인 GUI
+# 8. CalibrationDialog: 캘리브레이션 영상 지정
+# ─────────────────────────────────────────────
+class CalibrationDialog(tk.Toplevel):
+    """각 카메라 폴더에서 렌즈 캘리브레이션 영상 1개를 선택하는 다이얼로그."""
+
+    def __init__(self, parent, cam_folders, current_calibration=None):
+        super().__init__(parent)
+        self.title("캘리브레이션 영상 지정")
+        self.geometry("700x400")
+        self.result = None  # None=취소, {}=해제, {cam:VideoInfo}=지정
+        self.cam_folders = cam_folders
+        self.current_calibration = current_calibration or {}
+        self.combos = {}
+        self.video_maps = {}  # {cam: {display_str: VideoInfo}}
+        self.transient(parent)
+        self.grab_set()
+        self._setup_ui()
+        self.wait_window(self)
+
+    def _setup_ui(self):
+        tk.Label(self,
+                 text="각 카메라에서 렌즈 캘리브레이션 영상을 선택하세요",
+                 font=('Arial', 11, 'bold')).pack(pady=10, padx=10)
+        tk.Label(self,
+                 text="선택된 영상은 C0001로 지정되며, 동기화 매칭은 C0002부터 시작됩니다.",
+                 fg='gray').pack(padx=10)
+
+        # 스크롤 가능한 프레임
+        canvas = tk.Canvas(self)
+        scrollbar = ttk.Scrollbar(self, orient=tk.VERTICAL, command=canvas.yview)
+        inner = tk.Frame(canvas)
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.create_window((0, 0), window=inner, anchor='nw')
+        canvas.configure(yscrollcommand=scrollbar.set)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=10, pady=10)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y, pady=10)
+
+        for cam_name in sorted(self.cam_folders.keys(), key=natural_sort_key):
+            row = tk.Frame(inner)
+            row.pack(fill=tk.X, pady=4)
+
+            tk.Label(row, text=f"{cam_name}:", width=10, anchor='w',
+                     font=('Arial', 10, 'bold')).pack(side=tk.LEFT)
+
+            videos = self.cam_folders[cam_name]
+            self.video_maps[cam_name] = {}
+            display_list = []
+            for v in videos:
+                display = f"{v.filename}  ({v.duration:.2f}초)"
+                display_list.append(display)
+                self.video_maps[cam_name][display] = v
+
+            combo = ttk.Combobox(row, values=display_list,
+                                 state='readonly', width=55)
+            # 기존 선택이 있으면 해당 항목으로 설정
+            if cam_name in self.current_calibration:
+                cal = self.current_calibration[cam_name]
+                for display, video in self.video_maps[cam_name].items():
+                    if video.filepath == cal.filepath:
+                        combo.set(display)
+                        break
+            elif display_list:
+                combo.current(0)
+            combo.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+            self.combos[cam_name] = combo
+
+        # 버튼
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=15)
+
+        tk.Button(btn_frame, text="확인", command=self._confirm,
+                  width=12, height=2, bg='#4CAF50', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="해제", command=self._clear,
+                  width=12, height=2, bg='#FF9800', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+        tk.Button(btn_frame, text="취소", command=self._cancel,
+                  width=12, height=2, bg='#f44336', fg='white'
+                  ).pack(side=tk.LEFT, padx=10)
+
+    def _confirm(self):
+        self.result = {}
+        for cam_name, combo in self.combos.items():
+            selected = combo.get()
+            if selected and selected in self.video_maps[cam_name]:
+                self.result[cam_name] = self.video_maps[cam_name][selected]
+        self.destroy()
+
+    def _clear(self):
+        self.result = {}  # 빈 dict = 캘리브레이션 해제
+        self.destroy()
+
+    def _cancel(self):
+        self.result = None  # None = 취소 (변경 없음)
+        self.destroy()
+
+
+# ─────────────────────────────────────────────
+# 9. 메인 GUI
 # ─────────────────────────────────────────────
 class VideoOrganizerGUI:
     def __init__(self):
@@ -1238,6 +1356,8 @@ class VideoOrganizerGUI:
 
         tk.Button(control_frame, text="1. 스캔 & 매칭", command=self.step1_scan_match,
                   width=15, height=2, bg='#FF5722', fg='white').pack(side=tk.LEFT, padx=3)
+        tk.Button(control_frame, text="캘리브 지정", command=self.set_calibration,
+                  width=10, height=2, bg='#607D8B', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="2. 세트 프리뷰", command=self.step2_preview_sets,
                   width=15, height=2, bg='#E91E63', fg='white').pack(side=tk.LEFT, padx=3)
         tk.Button(control_frame, text="3. 리네임", command=self.step3_rename,
@@ -1491,6 +1611,79 @@ class VideoOrganizerGUI:
         # 세트 목록 테이블 표시 및 채우기
         if not self.set_table_visible:
             self.content_paned.add(self.set_table_frame, stretch='always', height=250)
+            self.set_table_visible = True
+        self._populate_set_table()
+
+    # ── 캘리브레이션 지정 ──
+    def set_calibration(self):
+        if not self.matcher.cam_folders:
+            messagebox.showwarning("경고", "먼저 Step 1 (스캔 & 매칭)을 실행하세요.")
+            return
+
+        dialog = CalibrationDialog(self.root, self.matcher.cam_folders,
+                                   self.matcher.calibration_videos)
+
+        if dialog.result is None:  # 취소
+            return
+
+        self.matcher.set_calibration(dialog.result)
+
+        # 재매칭
+        self.result_text.delete(1.0, tk.END)
+
+        if dialog.result:
+            self.result_text.insert(tk.END,
+                "캘리브레이션 영상 지정 완료 → C0001\n\n", 'header')
+            for cam, video in sorted(dialog.result.items(),
+                                     key=lambda x: natural_sort_key(x[0])):
+                self.result_text.insert(tk.END,
+                    f"  {cam}: {video.filename} ({video.duration:.2f}초)\n", 'info')
+        else:
+            self.result_text.insert(tk.END, "캘리브레이션 해제 완료\n\n", 'header')
+
+        self.result_text.insert(tk.END, "\n세트 재매칭 중...\n", 'header')
+        self.root.update_idletasks()
+
+        matched = self.matcher.match_sets()
+
+        self.result_text.insert(tk.END,
+            f"\n매칭 결과: {len(matched)}개 세트\n\n", 'ok')
+
+        for set_name, cam_dict in matched:
+            durations = [v.duration for v in cam_dict.values()]
+            max_diff = max(durations) - min(durations) if len(durations) > 1 else 0
+
+            if set_name == "C0001" and self.matcher.calibration_videos:
+                self.result_text.insert(tk.END,
+                    f"  {set_name} [캘리브레이션]: ", 'header')
+                self.result_text.insert(tk.END, "길이 무관\n", 'info')
+            else:
+                diff_tag = 'ok' if max_diff <= self.duration_var.get() else 'warning'
+                self.result_text.insert(tk.END, f"  {set_name}: ", 'header')
+                self.result_text.insert(tk.END,
+                    f"최대 차이 {max_diff:.3f}초\n", diff_tag)
+
+            for cam in sorted(cam_dict.keys(), key=natural_sort_key):
+                v = cam_dict[cam]
+                self.result_text.insert(tk.END,
+                    f"    {cam}/{v.filename} -> {set_name}.mp4  "
+                    f"({v.duration:.2f}초)\n", 'change')
+
+        total_unmatched = sum(len(v) for v in self.matcher.unmatched.values())
+        if total_unmatched > 0:
+            self.result_text.insert(tk.END,
+                f"\n미매칭 파일: {total_unmatched}개\n", 'warning')
+            for cam, videos in self.matcher.unmatched.items():
+                for v in videos:
+                    self.result_text.insert(tk.END,
+                        f"  {cam}/{v.filename} ({v.duration:.2f}초)\n", 'warning')
+
+        self.progress_var.set(
+            f"재매칭 완료: {len(matched)}개 세트, 미매칭 {total_unmatched}개")
+
+        if not self.set_table_visible:
+            self.content_paned.add(self.set_table_frame,
+                                   stretch='always', height=250)
             self.set_table_visible = True
         self._populate_set_table()
 
